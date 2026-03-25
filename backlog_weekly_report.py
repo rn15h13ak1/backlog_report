@@ -64,12 +64,13 @@ class BacklogClient:
         params = params or {}
         params["apiKey"] = self.api_key
 
-        # リストパラメータを展開（例: statusId[] → statusId[]=1&statusId[]=2）
+        # リストパラメータを展開（例: statusId[] → statusId%5B%5D=1&statusId%5B%5D=2）
+        # 注意: [ ] はRFC3986のクエリ文字として非合法なため %5B %5D にエンコードする
         query_parts = []
         for key, value in params.items():
             if isinstance(value, list):
                 for v in value:
-                    query_parts.append(f"{urllib.parse.quote(key)}[]={urllib.parse.quote(str(v))}")
+                    query_parts.append(f"{urllib.parse.quote(key)}%5B%5D={urllib.parse.quote(str(v))}")
             else:
                 query_parts.append(f"{urllib.parse.quote(key)}={urllib.parse.quote(str(value))}")
         query_string = "&".join(query_parts)
