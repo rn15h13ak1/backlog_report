@@ -586,7 +586,11 @@ def main():
         print("エラー: config.yaml の project_key を設定してください", file=sys.stderr)
         sys.exit(1)
 
-    output_dir = Path(report_cfg.get("output_dir", "./reports"))
+    output_dir_raw = report_cfg.get("output_dir", "./reports")
+    output_dir = Path(output_dir_raw)
+    if not output_dir.is_absolute():
+        # 相対パスはスクリプトと同じディレクトリ基準で解決（フルパス実行対応）
+        output_dir = Path(__file__).parent / output_dir
     open_status_ids = report_cfg.get("open_status_ids", [1, 2, 3])
     closed_status_ids = report_cfg.get("closed_status_ids", [4])
 
