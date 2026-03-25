@@ -33,6 +33,7 @@ import ssl
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import yaml
 from datetime import datetime, timedelta, date
@@ -72,8 +73,19 @@ class BacklogClient:
 
         url = f"{self.base_url}{endpoint}?{query_string}"
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
-            return json.loads(res.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print(f"エラー: 認証に失敗しました（HTTP 401）。api_key を確認してください。", file=sys.stderr)
+            elif e.code == 403:
+                print(f"エラー: アクセスが拒否されました（HTTP 403）。api_key の権限を確認してください。", file=sys.stderr)
+            elif e.code == 404:
+                print(f"エラー: リソースが見つかりません（HTTP 404）。space_host または project_key を確認してください。", file=sys.stderr)
+            else:
+                print(f"エラー: HTTPエラーが発生しました（HTTP {e.code}）: {e.reason}", file=sys.stderr)
+            sys.exit(1)
 
     def get_project(self, project_key: str) -> dict:
         """プロジェクト情報を取得"""
@@ -597,9 +609,10 @@ def main():
     print("プロジェクト情報を取得中...")
     try:
         project = client.get_project(project_key)
+    except SystemExit:
+        raise
     except Exception as e:
         print(f"エラー: プロジェクト情報の取得に失敗しました: {e}", file=sys.stderr)
-        print("  → space_host、api_key、project_key の設定を確認してください", file=sys.stderr)
         sys.exit(1)
 
     project_id = project["id"]
