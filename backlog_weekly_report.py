@@ -137,12 +137,6 @@ class BacklogClient:
         """プロジェクトのステータス一覧を取得"""
         return self._get(f"/projects/{project_id_or_key}/statuses")
 
-    def get_issue_activities(self, issue_id_or_key: str | int) -> list:
-        """課題のアクティビティ一覧を取得（typeId=2: 課題更新）"""
-        return self._get(f"/issues/{issue_id_or_key}/activities", {
-            "activityTypeId": [2],
-        })
-
     def get_issues(self, project_id: int, params: dict = None) -> list:
         """
         課題一覧を全件取得（ページネーション対応）
@@ -310,56 +304,66 @@ def resolve_filter_params(
 # 集計ロジック
 # ==============================================================
 
-def filter_completed_in_period(
+def get_completed_issue_ids_from_project_activities(
     client: BacklogClient,
-    candidates: list,
+    project_key: str,
     week_start: date,
     week_end: date,
     closed_status_names: set,
-) -> list:
+) -> set:
     """
-    候補課題のアクティビティログを確認し、
-    対象期間内にステータスが「完了」系に変化した課題だけを返す。
+    /projects/{key}/activities（typeId=2: 課題更新）を降順に取得し、
+    対象期間内にステータスが完了系へ変化した課題の数値IDセットを返す。
 
-    Backlog API には「完了日」フィルターがないため、
-    課題ごとのアクティビティ（typeId=2: 課題更新）を検索し、
-    period 内に status フィールドが closed_status_names に変わった
-    アクティビティが存在するかを確認する。
-
-    アクティビティ取得に失敗した場合は、安全側に倒して候補を含める。
+    Backlog API には課題単位のアクティビティ取得エンドポイントが
+    存在しないオンプレミス版があるため、プロジェクト全体のアクティビティを
+    ID降順（新しい順）にページネーションしながら走査する。
+    対象期間より古いアクティビティが出た時点で走査を打ち切る。
     """
-    result = []
-    for issue in candidates:
-        issue_key = issue.get("issueKey", "")
-        was_completed_in_period = False
-        try:
-            activities = client.get_issue_activities(issue_key)
-            for act in activities:
-                # アクティビティ日時（例: "2026-03-20T10:00:00Z"）
-                created_str = act.get("created", "")[:10]  # "YYYY-MM-DD"
-                try:
-                    act_date = datetime.strptime(created_str, "%Y-%m-%d").date()
-                except ValueError:
-                    continue
-                if not (week_start <= act_date <= week_end):
-                    continue
-                # status フィールドが完了系に変化したかチェック
+    completed_ids: set = set()
+    params: dict = {
+        "activityTypeId": [2],  # ISSUE_UPDATED のみ
+        "count": 100,
+        "order": "desc",        # 新しい順
+    }
+
+    while True:
+        activities = client._get(f"/projects/{project_key}/activities", params)
+        if not activities:
+            break
+
+        stop = False
+        for act in activities:
+            created_str = act.get("created", "")[:10]  # "YYYY-MM-DD"
+            try:
+                act_date = datetime.strptime(created_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            # 対象期間より古ければ終了
+            if act_date < week_start:
+                stop = True
+                break
+
+            # 対象期間内のみ処理
+            if act_date <= week_end:
                 changes = act.get("content", {}).get("changes", [])
                 for change in changes:
                     if (change.get("field") == "status"
                             and change.get("new_value") in closed_status_names):
-                        was_completed_in_period = True
-                        break
-                if was_completed_in_period:
-                    break
-            time.sleep(0.2)  # APIレート制限を考慮
-        except Exception:
-            # 取得失敗時はフォールバック（候補をそのまま含める）
-            was_completed_in_period = True
+                        issue_id = act.get("content", {}).get("id")
+                        if issue_id is not None:
+                            completed_ids.add(issue_id)
 
-        if was_completed_in_period:
-            result.append(issue)
-    return result
+        if stop or len(activities) < 100:
+            break
+
+        # 次ページ: 今回取得した中の最小IDより前を取得
+        min_id = min(act["id"] for act in activities)
+        params["maxId"] = min_id - 1
+        time.sleep(0.3)
+
+    return completed_ids
 
 
 def collect_report_data(
@@ -394,15 +398,8 @@ def collect_report_data(
         "createdUntil": we,
     })
 
-    # ③ 当週完了：アクティビティログで期間内のステータス変化を正確に判定
-    #    Step A: 現在完了かつ期間内に更新された課題を候補として取得
-    candidates = client.get_issues(project_id, {
-        **ep,
-        "statusId": closed_status_ids,
-        "updatedSince": ws,
-        "updatedUntil": we,
-    })
-    #    Step B: ステータス名マップを取得して期間内に完了に変化した課題だけ残す
+    # ③ 当週完了：プロジェクトアクティビティで期間内のステータス変化を正確に判定
+    #    Step A: ステータス名マップを取得
     try:
         statuses = client.get_statuses(project_key)
         closed_status_names = {
@@ -412,12 +409,27 @@ def collect_report_data(
         closed_status_names = set()
 
     if closed_status_names:
-        completed_issues = filter_completed_in_period(
-            client, candidates, week_start, week_end, closed_status_names
+        #    Step B: プロジェクトアクティビティから期間内に完了へ変化した課題IDを収集
+        completed_ids = get_completed_issue_ids_from_project_activities(
+            client, project_key, week_start, week_end, closed_status_names
         )
+        #    Step C: 現在も完了ステータスの全課題を取得し、IDで絞り込む
+        if completed_ids:
+            all_closed = client.get_issues(project_id, {
+                **ep,
+                "statusId": closed_status_ids,
+            })
+            completed_issues = [i for i in all_closed if i.get("id") in completed_ids]
+        else:
+            completed_issues = []
     else:
-        # ステータス名が取れない場合は候補をそのまま使用
-        completed_issues = candidates
+        # ステータス名が取れない場合は updatedSince/Until で近似（フォールバック）
+        completed_issues = client.get_issues(project_id, {
+            **ep,
+            "statusId": closed_status_ids,
+            "updatedSince": ws,
+            "updatedUntil": we,
+        })
 
     # ④ 未完了（現在オープンの全課題）
     incomplete_issues = client.get_issues(project_id, {
