@@ -384,22 +384,8 @@ def collect_report_data(
     we = week_end.strftime("%Y-%m-%d")
     ep = extra_params or {}
 
-    # ① 前週からの残件（week_start より前に作成され、現在も未完了）
-    carry_over_issues = client.get_issues(project_id, {
-        **ep,
-        "statusId": open_status_ids,
-        "createdUntil": (week_start - timedelta(days=1)).strftime("%Y-%m-%d"),
-    })
-
-    # ② 新規発生（対象週に作成された課題、ステータス問わず）
-    new_issues = client.get_issues(project_id, {
-        **ep,
-        "createdSince": ws,
-        "createdUntil": we,
-    })
-
-    # ③ 当週完了：プロジェクトアクティビティで期間内のステータス変化を正確に判定
-    #    Step A: ステータス名マップを取得
+    # ---- ③ 当週完了（先に計算。①の残件判定に使用する） ----
+    # プロジェクトアクティビティで期間内のステータス変化を正確に判定
     try:
         statuses = client.get_statuses(project_key)
         closed_status_names = {
@@ -409,11 +395,11 @@ def collect_report_data(
         closed_status_names = set()
 
     if closed_status_names:
-        #    Step B: プロジェクトアクティビティから期間内に完了へ変化した課題IDを収集
+        # プロジェクトアクティビティから期間内に完了へ変化した課題IDを収集
         completed_ids = get_completed_issue_ids_from_project_activities(
             client, project_key, week_start, week_end, closed_status_names
         )
-        #    Step C: 現在も完了ステータスの全課題を取得し、IDで絞り込む
+        # 現在も完了ステータスの全課題を取得し、IDで絞り込む
         if completed_ids:
             all_closed = client.get_issues(project_id, {
                 **ep,
@@ -430,12 +416,44 @@ def collect_report_data(
             "updatedSince": ws,
             "updatedUntil": we,
         })
+    completed_id_set = {i.get("id") for i in completed_issues}
 
-    # ④ 未完了（現在オープンの全課題）
-    incomplete_issues = client.get_issues(project_id, {
+    # ---- ① 前週からの残件 ----
+    # 期間開始前に作成され、期間開始前に完了していない課題
+    #   = 現在もオープンで期間前に作成された課題
+    #   + 期間中に完了したが期間前に作成された課題（期間開始時はオープンだった）
+    carry_over_open = client.get_issues(project_id, {
         **ep,
         "statusId": open_status_ids,
+        "createdUntil": (week_start - timedelta(days=1)).strftime("%Y-%m-%d"),
     })
+    carry_over_completed = [
+        i for i in completed_issues
+        if i.get("created", "")[:10] < ws  # 期間開始日より前に作成
+    ]
+    # 重複排除してマージ
+    seen_ids = set()
+    carry_over_issues = []
+    for i in carry_over_open + carry_over_completed:
+        iid = i.get("id")
+        if iid not in seen_ids:
+            seen_ids.add(iid)
+            carry_over_issues.append(i)
+
+    # ---- ② 新規発生（対象期間に作成された課題、ステータス問わず） ----
+    new_issues = client.get_issues(project_id, {
+        **ep,
+        "createdSince": ws,
+        "createdUntil": we,
+    })
+
+    # ---- ④ 当週未完了 ----
+    # 期間最終日時点でオープンの課題 = (残件 + 新規) - 完了
+    all_issues_map = {}
+    for i in carry_over_issues + new_issues:
+        all_issues_map[i.get("id")] = i
+    incomplete_ids = set(all_issues_map.keys()) - completed_id_set
+    incomplete_issues = [all_issues_map[iid] for iid in incomplete_ids]
 
     return {
         "carry_over": carry_over_issues,
@@ -522,7 +540,7 @@ def generate_markdown_report(
         f"| 前週からの残件数 | **{len(carry_over)}** 件 |",
         f"| 新規発生件数 | **{len(new_issues)}** 件 |",
         f"| 当週完了件数 | **{len(completed)}** 件 |",
-        f"| 現在の未完了件数 | **{len(incomplete)}** 件 |",
+        f"| 当週未完了件数 | **{len(incomplete)}** 件 |",
         "",
     ]
 
@@ -541,7 +559,7 @@ def generate_markdown_report(
         "---",
         "",
         "## 前週からの残件",
-        f"**{len(carry_over)} 件** — {week_start.strftime('%Y/%m/%d')} より前に作成され、現在も未完了の課題",
+        f"**{len(carry_over)} 件** — {week_start.strftime('%Y/%m/%d')} より前に作成され、{week_start.strftime('%Y/%m/%d')} 時点で未完了の課題",
         "",
         keys_str(carry_over),
         "",
@@ -579,8 +597,8 @@ def generate_markdown_report(
         "",
         "---",
         "",
-        "## 現在の未完了一覧",
-        f"**{len(incomplete)} 件** — 現在オープン（未対応・処理中・処理済み）の課題",
+        "## 当週未完了一覧",
+        f"**{len(incomplete)} 件** — {we_str} 時点でオープン（未対応・処理中）の課題",
         "",
         keys_str(incomplete),
         "",
