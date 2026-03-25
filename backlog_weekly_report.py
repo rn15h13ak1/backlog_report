@@ -343,6 +343,20 @@ def generate_markdown_report(
         f"| 当週完了件数 | **{len(completed)}** 件 |",
         f"| 現在の未完了件数 | **{len(incomplete)}** 件 |",
         "",
+    ]
+
+    # 等式チェック: 残件 + 新規 = 完了 + 未完了
+    lhs = len(carry_over) + len(new_issues)
+    rhs = len(completed) + len(incomplete)
+    if lhs != rhs:
+        lines += [
+            f"> ⚠️ **注意**: 残件数（{len(carry_over)}）＋ 新規発生（{len(new_issues)}）"
+            f"＝ {lhs} に対し、完了（{len(completed)}）＋ 未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
+            "> 期間中に処理済みから処理中への差し戻しが発生している可能性があります。",
+            "",
+        ]
+
+    lines += [
         "---",
         "",
         "## 前週からの残件",
