@@ -1,0 +1,34 @@
+# ============================================================
+# Backlog 週次レポート 設定ファイル
+# ============================================================
+# このファイルを編集して、あなたの環境に合わせてください
+
+backlog:
+  # スペースのホスト名（例: yourcompany.backlog.com または yourcompany.backlogtool.com）
+  space_host: "yourcompany.backlog.com"
+
+  # Backlog API キー（個人設定ページから取得）
+  # 取得場所: Backlog画面右上 → 個人設定 → API → APIキーの発行
+  api_key: "YOUR_API_KEY_HERE"
+
+  # 集計対象のプロジェクトキー（例: MYPROJECT）
+  # プロジェクトキーはBacklogのURL（/projects/XXXXX）から確認できます
+  project_key: "YOUR_PROJECT_KEY"
+
+report:
+  # 対象週の設定
+  # "previous" = 前週（月〜日）を集計（毎週月曜日に実行する場合に推奨）
+  # "current"  = 今週（月曜〜今日まで）を集計
+  target_week: "previous"
+
+  # 週の開始曜日（"monday" または "sunday"）
+  week_start: "monday"
+
+  # レポートの出力先ディレクトリ（相対パスまたは絶対パス）
+  output_dir: "./reports"
+
+  # ステータス設定（通常は変更不要）
+  # 未完了とみなすステータスID（1:未対応, 2:処理中, 3:処理済み）
+  open_status_ids: [1, 2, 3]
+  # 完了とみなすステータスID（4:完了）
+  closed_status_ids: [4]
