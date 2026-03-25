@@ -133,6 +133,16 @@ class BacklogClient:
         """プロジェクトのカスタム属性一覧を取得"""
         return self._get(f"/projects/{project_id_or_key}/customFields")
 
+    def get_statuses(self, project_id_or_key: str | int) -> list:
+        """プロジェクトのステータス一覧を取得"""
+        return self._get(f"/projects/{project_id_or_key}/statuses")
+
+    def get_issue_activities(self, issue_id_or_key: str | int) -> list:
+        """課題のアクティビティ一覧を取得（typeId=2: 課題更新）"""
+        return self._get(f"/issues/{issue_id_or_key}/activities", {
+            "activityTypeId": [2],
+        })
+
     def get_issues(self, project_id: int, params: dict = None) -> list:
         """
         課題一覧を全件取得（ページネーション対応）
@@ -300,8 +310,61 @@ def resolve_filter_params(
 # 集計ロジック
 # ==============================================================
 
+def filter_completed_in_period(
+    client: BacklogClient,
+    candidates: list,
+    week_start: date,
+    week_end: date,
+    closed_status_names: set,
+) -> list:
+    """
+    候補課題のアクティビティログを確認し、
+    対象期間内にステータスが「完了」系に変化した課題だけを返す。
+
+    Backlog API には「完了日」フィルターがないため、
+    課題ごとのアクティビティ（typeId=2: 課題更新）を検索し、
+    period 内に status フィールドが closed_status_names に変わった
+    アクティビティが存在するかを確認する。
+
+    アクティビティ取得に失敗した場合は、安全側に倒して候補を含める。
+    """
+    result = []
+    for issue in candidates:
+        issue_key = issue.get("issueKey", "")
+        was_completed_in_period = False
+        try:
+            activities = client.get_issue_activities(issue_key)
+            for act in activities:
+                # アクティビティ日時（例: "2026-03-20T10:00:00Z"）
+                created_str = act.get("created", "")[:10]  # "YYYY-MM-DD"
+                try:
+                    act_date = datetime.strptime(created_str, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if not (week_start <= act_date <= week_end):
+                    continue
+                # status フィールドが完了系に変化したかチェック
+                changes = act.get("content", {}).get("changes", [])
+                for change in changes:
+                    if (change.get("field") == "status"
+                            and change.get("new_value") in closed_status_names):
+                        was_completed_in_period = True
+                        break
+                if was_completed_in_period:
+                    break
+            time.sleep(0.2)  # APIレート制限を考慮
+        except Exception:
+            # 取得失敗時はフォールバック（候補をそのまま含める）
+            was_completed_in_period = True
+
+        if was_completed_in_period:
+            result.append(issue)
+    return result
+
+
 def collect_report_data(
     client: BacklogClient,
+    project_key: str,
     project_id: int,
     week_start: date,
     week_end: date,
@@ -331,14 +394,30 @@ def collect_report_data(
         "createdUntil": we,
     })
 
-    # ③ 当週完了（対象週に更新された完了ステータスの課題）
-    #    ※ Backlog APIに「完了日」フィルタがないため updatedSince/Until で近似
-    completed_issues = client.get_issues(project_id, {
+    # ③ 当週完了：アクティビティログで期間内のステータス変化を正確に判定
+    #    Step A: 現在完了かつ期間内に更新された課題を候補として取得
+    candidates = client.get_issues(project_id, {
         **ep,
         "statusId": closed_status_ids,
         "updatedSince": ws,
         "updatedUntil": we,
     })
+    #    Step B: ステータス名マップを取得して期間内に完了に変化した課題だけ残す
+    try:
+        statuses = client.get_statuses(project_key)
+        closed_status_names = {
+            s["name"] for s in statuses if s["id"] in closed_status_ids
+        }
+    except Exception:
+        closed_status_names = set()
+
+    if closed_status_names:
+        completed_issues = filter_completed_in_period(
+            client, candidates, week_start, week_end, closed_status_names
+        )
+    else:
+        # ステータス名が取れない場合は候補をそのまま使用
+        completed_issues = candidates
 
     # ④ 未完了（現在オープンの全課題）
     incomplete_issues = client.get_issues(project_id, {
@@ -716,7 +795,7 @@ def main():
     if not filters_cfg:
         print("【フィルターなし】全課題を集計中...")
         data = collect_report_data(
-            client, project_id, week_start, week_end,
+            client, project_key, project_id, week_start, week_end,
             open_status_ids, closed_status_ids
         )
         report_md = generate_markdown_report(
@@ -743,7 +822,7 @@ def main():
             print(f"  [DEBUG] 解決済みフィルターパラメータ: {extra_params}", file=sys.stderr)
 
         data = collect_report_data(
-            client, project_id, week_start, week_end,
+            client, project_key, project_id, week_start, week_end,
             open_status_ids, closed_status_ids,
             extra_params=extra_params,
         )
