@@ -2,21 +2,29 @@
 """
 Backlog 週次レポート生成スクリプト
 ====================================
-前週（または当週）の課題集計をMarkdownファイルとして出力します。
+指定した期間の課題集計をMarkdownファイルとして出力します。
 config.yaml の filters に複数のフィルターを定義すると、
 フィルターごとに個別のレポートファイルが生成されます。
 
 集計内容:
-  - 前週からの残件数（前週開始時点で未完了だった課題数）
-  - 新規発生件数（対象週に作成された課題数）
-  - 当週完了件数（対象週に完了した課題数）
+  - 期間開始前からの残件数（期間開始より前に作成され現在も未完了の課題数）
+  - 新規発生件数（対象期間に作成された課題数）
+  - 期間内完了件数（対象期間に完了した課題数）
   - 未完了件数（現在オープンの課題数）
   - 各カテゴリのBacklog課題番号一覧
 
 使い方:
+  # 前週を自動計算して集計（デフォルト）
   python backlog_weekly_report.py
-  python backlog_weekly_report.py --config path/to/config.yaml
+
+  # 今週（月曜〜今日）を集計
   python backlog_weekly_report.py --week current
+
+  # 期間を直接指定して集計
+  python backlog_weekly_report.py --from 2026-03-01 --to 2026-03-31
+
+  # 設定ファイルを指定
+  python backlog_weekly_report.py --config path/to/config.yaml --from 2026-03-01 --to 2026-03-15
 """
 
 import argparse
@@ -313,7 +321,7 @@ def generate_markdown_report(
 
     title_suffix = f" — {filter_name}" if filter_name else ""
     lines = [
-        f"# 週次レポート{title_suffix} — {ws_str} 〜 {we_str}",
+        f"# レポート{title_suffix} — {ws_str} 〜 {we_str}",
         "",
         f"> プロジェクト: **{project_name}** (`{project_key}`)  ",
     ]
@@ -430,12 +438,36 @@ def load_config(config_path: str) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Backlog 週次レポート生成")
+    parser = argparse.ArgumentParser(
+        description="Backlog レポート生成",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+期間指定の優先順位:
+  1. --from / --to  （最優先）
+  2. --week         （前週 or 今週の自動計算）
+  3. config.yaml の target_week 設定
+
+例:
+  python backlog_weekly_report.py --from 2026-03-01 --to 2026-03-31
+  python backlog_weekly_report.py --week current
+  python backlog_weekly_report.py
+""",
+    )
     parser.add_argument("--config", default="config.yaml",
                         help="設定ファイルのパス（デフォルト: config.yaml）")
     parser.add_argument("--week", choices=["previous", "current"],
                         help="対象週の指定（設定ファイルの値を上書き）")
+    parser.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD",
+                        help="集計開始日（例: 2026-03-01）。--to と併用。")
+    parser.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
+                        help="集計終了日（例: 2026-03-31）。--from と併用。")
     args = parser.parse_args()
+
+    # --from / --to の検証
+    if bool(args.date_from) != bool(args.date_to):
+        parser.error("--from と --to は両方セットで指定してください。")
+    if args.date_from and args.week:
+        parser.error("--from/--to と --week は同時に指定できません。")
 
     # 設定読み込み
     config = load_config(args.config)
@@ -457,21 +489,33 @@ def main():
         print("エラー: config.yaml の project_key を設定してください", file=sys.stderr)
         sys.exit(1)
 
-    target_week = args.week or report_cfg.get("target_week", "previous")
-    week_start_day = report_cfg.get("week_start", "monday")
     output_dir = Path(report_cfg.get("output_dir", "./reports"))
     open_status_ids = report_cfg.get("open_status_ids", [1, 2, 3])
     closed_status_ids = report_cfg.get("closed_status_ids", [4])
 
-    week_start, week_end = get_week_range(target_week, week_start_day)
+    # 期間の決定: --from/--to > --week > config の target_week
+    if args.date_from:
+        try:
+            week_start = datetime.strptime(args.date_from, "%Y-%m-%d").date()
+            week_end   = datetime.strptime(args.date_to,   "%Y-%m-%d").date()
+        except ValueError:
+            parser.error("日付は YYYY-MM-DD 形式で入力してください（例: 2026-03-01）")
+        if week_start > week_end:
+            parser.error("--from は --to より前の日付を指定してください。")
+        period_label = "指定期間"
+    else:
+        target_week   = args.week or report_cfg.get("target_week", "previous")
+        week_start_day = report_cfg.get("week_start", "monday")
+        week_start, week_end = get_week_range(target_week, week_start_day)
+        period_label = "前週" if target_week == "previous" else "今週"
 
     print("=" * 55)
-    print("Backlog 週次レポート生成")
+    print("Backlog レポート生成")
     print("=" * 55)
-    print(f"スペース  : {space_host}")
-    print(f"プロジェクト: {project_key}")
-    print(f"対象週    : {week_start} 〜 {week_end}")
-    print(f"フィルター数: {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
+    print(f"スペース    : {space_host}")
+    print(f"プロジェクト : {project_key}")
+    print(f"対象期間    : {week_start} 〜 {week_end}（{period_label}）")
+    print(f"フィルター数 : {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
     print()
 
     client = BacklogClient(space_host, api_key)
