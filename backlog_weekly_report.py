@@ -473,8 +473,8 @@ def format_issue_table(issues: list, max_display: int = 30) -> str:
         return "_（該当なし）_\n"
 
     lines = [
-        "| 課題番号 | 件名 | ステータス | 担当者 |",
-        "|---------|------|-----------|-------|",
+        "| 課題番号 | 件名 | ステータス | 担当者 | 期限日 |",
+        "|---------|------|-----------|-------|-------|",
     ]
     for issue in issues[:max_display]:
         issue_key = issue.get("issueKey", "-")
@@ -482,7 +482,9 @@ def format_issue_table(issues: list, max_display: int = 30) -> str:
         status = issue.get("status", {}).get("name", "-")
         assignee = issue.get("assignee")
         assignee_name = assignee.get("name", "-") if assignee else "_未割当_"
-        lines.append(f"| {issue_key} | {summary} | {status} | {assignee_name} |")
+        due_raw = issue.get("dueDate")
+        due_date = due_raw[:10] if due_raw else "-"  # "YYYY-MM-DDTHH:mm:ss" → "YYYY-MM-DD"
+        lines.append(f"| {issue_key} | {summary} | {status} | {assignee_name} | {due_date} |")
 
     if len(issues) > max_display:
         lines.append(f"\n_...他 {len(issues) - max_display} 件（表示上限 {max_display} 件）_")
