@@ -493,8 +493,11 @@ def main():
     open_status_ids = report_cfg.get("open_status_ids", [1, 2, 3])
     closed_status_ids = report_cfg.get("closed_status_ids", [4])
 
-    # 期間の決定: --from/--to > --week > config の target_week
+    # 期間の決定: --from/--to > --week > config.period > config.target_week
+    cfg_period = report_cfg.get("period") or {}
+
     if args.date_from:
+        # 最優先: コマンドライン引数
         try:
             week_start = datetime.strptime(args.date_from, "%Y-%m-%d").date()
             week_end   = datetime.strptime(args.date_to,   "%Y-%m-%d").date()
@@ -502,9 +505,29 @@ def main():
             parser.error("日付は YYYY-MM-DD 形式で入力してください（例: 2026-03-01）")
         if week_start > week_end:
             parser.error("--from は --to より前の日付を指定してください。")
-        period_label = "指定期間"
+        period_label = "指定期間（引数）"
+    elif args.week:
+        # 2番目: --week オプション
+        week_start_day = report_cfg.get("week_start", "monday")
+        week_start, week_end = get_week_range(args.week, week_start_day)
+        period_label = "前週" if args.week == "previous" else "今週"
+    elif cfg_period.get("from") and cfg_period.get("to"):
+        # 3番目: config.yaml の period 設定
+        try:
+            week_start = datetime.strptime(str(cfg_period["from"]), "%Y-%m-%d").date()
+            week_end   = datetime.strptime(str(cfg_period["to"]),   "%Y-%m-%d").date()
+        except ValueError:
+            print("エラー: config.yaml の report.period.from / to は YYYY-MM-DD 形式で記入してください",
+                  file=sys.stderr)
+            sys.exit(1)
+        if week_start > week_end:
+            print("エラー: config.yaml の report.period.from は to より前の日付にしてください",
+                  file=sys.stderr)
+            sys.exit(1)
+        period_label = "指定期間（config）"
     else:
-        target_week   = args.week or report_cfg.get("target_week", "previous")
+        # 最終フォールバック: target_week の自動計算
+        target_week    = report_cfg.get("target_week", "previous")
         week_start_day = report_cfg.get("week_start", "monday")
         week_start, week_end = get_week_range(target_week, week_start_day)
         period_label = "前週" if target_week == "previous" else "今週"
