@@ -15,6 +15,10 @@ backlog:
   # プロジェクトキーはBacklogのURL（/projects/XXXXX）から確認できます
   project_key: "YOUR_PROJECT_KEY"
 
+  # SSL証明書の検証（通常は true のまま）
+  # 自己署名証明書を使用したクローズド環境では false に設定してください
+  ssl_verify: true
+
 report:
   # ============================================================
   # 期間設定（優先順位: コマンドライン引数 > period > target_week）

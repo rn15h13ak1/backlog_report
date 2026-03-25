@@ -29,6 +29,7 @@ config.yaml の filters に複数のフィルターを定義すると、
 
 import argparse
 import sys
+import ssl
 import time
 import urllib.request
 import urllib.parse
@@ -43,9 +44,16 @@ from pathlib import Path
 # ==============================================================
 
 class BacklogClient:
-    def __init__(self, space_host: str, api_key: str):
+    def __init__(self, space_host: str, api_key: str, ssl_verify: bool = True):
         self.base_url = f"https://{space_host}/api/v2"
         self.api_key = api_key
+        # SSL検証を無効にする場合のコンテキスト
+        if ssl_verify:
+            self.ssl_context = None
+        else:
+            self.ssl_context = ssl.create_default_context()
+            self.ssl_context.check_hostname = False
+            self.ssl_context.verify_mode = ssl.CERT_NONE
 
     def _get(self, endpoint: str, params: dict = None) -> dict | list:
         """GETリクエストを送信してJSONを返す"""
@@ -64,7 +72,7 @@ class BacklogClient:
 
         url = f"{self.base_url}{endpoint}?{query_string}"
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=30) as res:
+        with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
             return json.loads(res.read().decode("utf-8"))
 
     def get_project(self, project_key: str) -> dict:
@@ -582,7 +590,8 @@ def main():
     print(f"フィルター数 : {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
     print()
 
-    client = BacklogClient(space_host, api_key)
+    ssl_verify = backlog_cfg.get("ssl_verify", True)
+    client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify)
 
     # プロジェクト情報取得
     print("プロジェクト情報を取得中...")
