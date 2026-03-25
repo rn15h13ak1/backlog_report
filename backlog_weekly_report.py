@@ -88,8 +88,10 @@ class BacklogClient:
         except urllib.error.HTTPError as e:
             # レスポンスボディから詳細メッセージを取得
             detail = ""
+            raw_body = ""
             try:
-                body = json.loads(e.read().decode("utf-8"))
+                raw_body = e.read().decode("utf-8")
+                body = json.loads(raw_body)
                 errors = body.get("errors", [])
                 if errors:
                     detail = " / ".join(
@@ -103,6 +105,9 @@ class BacklogClient:
             print(f"エラー: API呼び出しに失敗しました（HTTP {e.code}）: {endpoint}", file=sys.stderr)
             if detail:
                 print(f"  詳細: {detail}", file=sys.stderr)
+            elif raw_body:
+                # detailが取れない場合はボディをそのまま表示（デバッグ用）
+                print(f"  レスポンス: {raw_body[:500]}", file=sys.stderr)
 
             if e.code == 400:
                 print("  → リクエストパラメータを確認してください。", file=sys.stderr)
@@ -659,7 +664,10 @@ def main():
         try:
             issue_types = client.get_issue_types(project_key)
             issue_type_map = {it["name"]: it["id"] for it in issue_types}
-            print(f"  種別: {list(issue_type_map.keys())}")
+            if args.debug:
+                print(f"  [DEBUG] 種別マップ（名前→ID）: {issue_type_map}", file=sys.stderr)
+            else:
+                print(f"  種別: {list(issue_type_map.keys())}")
         except Exception as e:
             print(f"  ⚠ 種別マスターの取得に失敗: {e}", file=sys.stderr)
 
@@ -669,7 +677,10 @@ def main():
                 cf["name"]: {"id": cf["id"], "typeId": cf.get("typeId")}
                 for cf in custom_fields
             }
-            print(f"  カスタム属性: {list(custom_field_map.keys())}")
+            if args.debug:
+                print(f"  [DEBUG] カスタム属性マップ（名前→{{id,typeId}}）: {custom_field_map}", file=sys.stderr)
+            else:
+                print(f"  カスタム属性: {list(custom_field_map.keys())}")
         except Exception as e:
             print(f"  ⚠ カスタム属性マスターの取得に失敗: {e}", file=sys.stderr)
 
@@ -703,6 +714,8 @@ def main():
 
         # フィルターパラメータを解決
         extra_params = resolve_filter_params(filter_cfg, issue_type_map, custom_field_map)
+        if args.debug:
+            print(f"  [DEBUG] 解決済みフィルターパラメータ: {extra_params}", file=sys.stderr)
 
         data = collect_report_data(
             client, project_id, week_start, week_end,
