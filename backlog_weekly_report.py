@@ -45,11 +45,12 @@ from pathlib import Path
 # ==============================================================
 
 class BacklogClient:
-    def __init__(self, space_host: str, api_key: str, ssl_verify: bool = True, base_path: str = ""):
+    def __init__(self, space_host: str, api_key: str, ssl_verify: bool = True, base_path: str = "", debug: bool = False):
         # base_path の前後スラッシュを正規化（例: "/backlog/" → "/backlog"）
         base_path = "/" + base_path.strip("/") if base_path.strip("/") else ""
         self.base_url = f"https://{space_host}{base_path}/api/v2"
         self.api_key = api_key
+        self.debug = debug
         # SSL検証を無効にする場合のコンテキスト
         if ssl_verify:
             self.ssl_context = None
@@ -74,6 +75,12 @@ class BacklogClient:
         query_string = "&".join(query_parts)
 
         url = f"{self.base_url}{endpoint}?{query_string}"
+
+        if self.debug:
+            # APIキーを除いたパラメータを表示
+            debug_parts = [p for p in query_parts if not p.startswith("apiKey=")]
+            print(f"  [DEBUG] {endpoint} ?" + "&".join(debug_parts), file=sys.stderr)
+
         req = urllib.request.Request(url)
         try:
             with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
@@ -543,6 +550,8 @@ def main():
                         help="集計開始日（例: 2026-03-01）。--to と併用。")
     parser.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
                         help="集計終了日（例: 2026-03-31）。--from と併用。")
+    parser.add_argument("--debug", action="store_true",
+                        help="APIリクエストのパラメータを表示する（トラブルシューティング用）")
     args = parser.parse_args()
 
     # --from / --to の検証
@@ -625,7 +634,7 @@ def main():
 
     ssl_verify = backlog_cfg.get("ssl_verify", True)
     base_path  = backlog_cfg.get("base_path", "")
-    client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify, base_path=base_path)
+    client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify, base_path=base_path, debug=args.debug)
 
     # プロジェクト情報取得
     print("プロジェクト情報を取得中...")
