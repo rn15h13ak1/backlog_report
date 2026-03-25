@@ -223,14 +223,14 @@ def get_week_range(target_week: str, week_start: str) -> tuple[date, date]:
 def resolve_filter_params(
     filter_cfg: dict,
     issue_type_map: dict,   # {名前: ID}
-    custom_field_map: dict, # {名前: {id, typeId}}
+    custom_field_map: dict, # {名前: {id, typeId, items: {名前: ID}}}
 ) -> dict:
     """
     config の filters[i] から Backlog API クエリパラメータを構築して返す。
 
     Returns:
         dict: get_issues() に追加で渡すパラメータ
-              例: {"issueTypeId": [1, 2], "customField_123": ["Aチーム"]}
+              例: {"issueTypeId": [1, 2], "customField_123": [456]}
     """
     extra = {}
 
@@ -257,10 +257,11 @@ def resolve_filter_params(
         if "field_id" in cf:
             field_id = cf["field_id"]
             type_id = None
-            # typeId を custom_field_map から引く（名前→IDの逆引き）
+            items_map = {}
             for info in custom_field_map.values():
                 if info["id"] == field_id:
                     type_id = info.get("typeId")
+                    items_map = info.get("items", {})
                     break
         elif "field_name" in cf:
             name = cf["field_name"]
@@ -269,19 +270,28 @@ def resolve_filter_params(
                 continue
             field_id = custom_field_map[name]["id"]
             type_id = custom_field_map[name].get("typeId")
+            items_map = custom_field_map[name].get("items", {})
         else:
             print("  ⚠ custom_fields に field_name または field_id が必要です（スキップ）",
                   file=sys.stderr)
             continue
 
         # typeId 5=単一リスト, 6=複数リスト, 7=チェックボックス, 8=ラジオ
-        # → これらはリスト型パラメータ（[] 付き）
-        # typeId 1=テキスト, 2=文章, 3=数値, 4=日付 → 単一値
+        # → 選択肢名を数値IDに変換してからリスト型パラメータ（[] 付き）で送信
+        # typeId 1=テキスト, 2=文章, 3=数値, 4=日付 → 単一値（変換不要）
         list_types = {5, 6, 7, 8}
+
+        def resolve_value(v):
+            """選択肢名 → 数値ID に変換（items_mapにあれば）"""
+            if isinstance(v, str) and v in items_map:
+                return items_map[v]
+            return v
+
         if type_id in list_types or len(values) > 1:
-            extra[f"customField_{field_id}"] = values  # リスト → []付きで送信
+            resolved = [resolve_value(v) for v in values]
+            extra[f"customField_{field_id}"] = resolved
         else:
-            extra[f"customField_{field_id}"] = values[0]
+            extra[f"customField_{field_id}"] = resolve_value(values[0])
 
     return extra
 
@@ -679,11 +689,21 @@ def main():
         try:
             custom_fields = client.get_custom_fields(project_key)
             custom_field_map = {
-                cf["name"]: {"id": cf["id"], "typeId": cf.get("typeId")}
+                cf["name"]: {
+                    "id": cf["id"],
+                    "typeId": cf.get("typeId"),
+                    # リスト型（typeId 5/6/7/8）の選択肢を {名前: ID} で保持
+                    "items": {
+                        item["name"]: item["id"]
+                        for item in cf.get("items", [])
+                    },
+                }
                 for cf in custom_fields
             }
             if args.debug:
-                print(f"  [DEBUG] カスタム属性マップ（名前→{{id,typeId}}）: {custom_field_map}", file=sys.stderr)
+                # items も含めた詳細マップを表示
+                for fname, finfo in custom_field_map.items():
+                    print(f"  [DEBUG] カスタム属性「{fname}」: id={finfo['id']}, typeId={finfo['typeId']}, items={finfo['items']}", file=sys.stderr)
             else:
                 print(f"  カスタム属性: {list(custom_field_map.keys())}")
         except Exception as e:
