@@ -4,8 +4,15 @@
 # このファイルを編集して、あなたの環境に合わせてください
 
 backlog:
-  # スペースのホスト名（例: yourcompany.backlog.com または yourcompany.backlogtool.com）
+  # スペースのホスト名またはIPアドレス
+  # クラウド版の例: yourcompany.backlog.com
+  # オンプレミス版の例: 192.168.1.100
   space_host: "yourcompany.backlog.com"
+
+  # オンプレミス版でパスプレフィックスがある場合に指定
+  # 例: URL が https://192.168.1.100/backlog/projects/... の場合は "/backlog" を設定
+  # クラウド版（backlog.com）の場合は空文字列のまま（または省略）
+  base_path: ""
 
   # Backlog API キー（個人設定ページから取得）
   # 取得場所: Backlog画面右上 → 個人設定 → API → APIキーの発行

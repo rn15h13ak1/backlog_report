@@ -45,8 +45,10 @@ from pathlib import Path
 # ==============================================================
 
 class BacklogClient:
-    def __init__(self, space_host: str, api_key: str, ssl_verify: bool = True):
-        self.base_url = f"https://{space_host}/api/v2"
+    def __init__(self, space_host: str, api_key: str, ssl_verify: bool = True, base_path: str = ""):
+        # base_path の前後スラッシュを正規化（例: "/backlog/" → "/backlog"）
+        base_path = "/" + base_path.strip("/") if base_path.strip("/") else ""
+        self.base_url = f"https://{space_host}{base_path}/api/v2"
         self.api_key = api_key
         # SSL検証を無効にする場合のコンテキスト
         if ssl_verify:
@@ -603,7 +605,8 @@ def main():
     print()
 
     ssl_verify = backlog_cfg.get("ssl_verify", True)
-    client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify)
+    base_path  = backlog_cfg.get("base_path", "")
+    client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify, base_path=base_path)
 
     # プロジェクト情報取得
     print("プロジェクト情報を取得中...")
