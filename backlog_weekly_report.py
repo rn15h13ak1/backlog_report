@@ -3,6 +3,8 @@
 Backlog 週次レポート生成スクリプト
 ====================================
 前週（または当週）の課題集計をMarkdownファイルとして出力します。
+config.yaml の filters に複数のフィルターを定義すると、
+フィルターごとに個別のレポートファイルが生成されます。
 
 集計内容:
   - 前週からの残件数（前週開始時点で未完了だった課題数）
@@ -19,7 +21,6 @@ Backlog 週次レポート生成スクリプト
 
 import argparse
 import sys
-import os
 import time
 import urllib.request
 import urllib.parse
@@ -62,6 +63,14 @@ class BacklogClient:
         """プロジェクト情報を取得"""
         return self._get(f"/projects/{project_key}")
 
+    def get_issue_types(self, project_id_or_key: str | int) -> list:
+        """プロジェクトの種別一覧を取得"""
+        return self._get(f"/projects/{project_id_or_key}/issueTypes")
+
+    def get_custom_fields(self, project_id_or_key: str | int) -> list:
+        """プロジェクトのカスタム属性一覧を取得"""
+        return self._get(f"/projects/{project_id_or_key}/customFields")
+
     def get_issues(self, project_id: int, params: dict = None) -> list:
         """
         課題一覧を全件取得（ページネーション対応）
@@ -88,13 +97,6 @@ class BacklogClient:
 
         return all_issues
 
-    def get_issue_count(self, project_id: int, params: dict = None) -> int:
-        """課題件数を取得"""
-        base_params = params or {}
-        base_params["projectId"] = [project_id]
-        result = self._get("/issues/count", base_params)
-        return result.get("count", 0)
-
 
 # ==============================================================
 # 週の日付範囲計算
@@ -109,14 +111,12 @@ def get_week_range(target_week: str, week_start: str) -> tuple[date, date]:
     """
     today = date.today()
 
-    # 今週月曜日（または日曜日）を求める
     if week_start == "monday":
         days_since_start = today.weekday()  # 月=0, 日=6
     else:  # sunday
-        days_since_start = (today.weekday() + 1) % 7  # 日=0, 月=1, ..., 土=6
+        days_since_start = (today.weekday() + 1) % 7
 
     this_week_start = today - timedelta(days=days_since_start)
-    this_week_end = this_week_start + timedelta(days=6)
 
     if target_week == "previous":
         week_start_date = this_week_start - timedelta(weeks=1)
@@ -129,58 +129,122 @@ def get_week_range(target_week: str, week_start: str) -> tuple[date, date]:
 
 
 # ==============================================================
+# フィルターパラメータ解決
+# ==============================================================
+
+def resolve_filter_params(
+    filter_cfg: dict,
+    issue_type_map: dict,   # {名前: ID}
+    custom_field_map: dict, # {名前: {id, typeId}}
+) -> dict:
+    """
+    config の filters[i] から Backlog API クエリパラメータを構築して返す。
+
+    Returns:
+        dict: get_issues() に追加で渡すパラメータ
+              例: {"issueTypeId": [1, 2], "customField_123": ["Aチーム"]}
+    """
+    extra = {}
+
+    # ---- 種別フィルター ----
+    issue_types = filter_cfg.get("issue_types") or []
+    if issue_types:
+        ids = []
+        for name in issue_types:
+            if name in issue_type_map:
+                ids.append(issue_type_map[name])
+            else:
+                print(f"  ⚠ 種別「{name}」が見つかりません（スキップ）", file=sys.stderr)
+        if ids:
+            extra["issueTypeId"] = ids
+
+    # ---- カスタム属性フィルター ----
+    custom_fields = filter_cfg.get("custom_fields") or []
+    for cf in custom_fields:
+        values = cf.get("values") or []
+        if not values:
+            continue
+
+        # field_id 直接指定 or field_name から解決
+        if "field_id" in cf:
+            field_id = cf["field_id"]
+            type_id = None
+            # typeId を custom_field_map から引く（名前→IDの逆引き）
+            for info in custom_field_map.values():
+                if info["id"] == field_id:
+                    type_id = info.get("typeId")
+                    break
+        elif "field_name" in cf:
+            name = cf["field_name"]
+            if name not in custom_field_map:
+                print(f"  ⚠ カスタム属性「{name}」が見つかりません（スキップ）", file=sys.stderr)
+                continue
+            field_id = custom_field_map[name]["id"]
+            type_id = custom_field_map[name].get("typeId")
+        else:
+            print("  ⚠ custom_fields に field_name または field_id が必要です（スキップ）",
+                  file=sys.stderr)
+            continue
+
+        # typeId 5=単一リスト, 6=複数リスト, 7=チェックボックス, 8=ラジオ
+        # → これらはリスト型パラメータ（[] 付き）
+        # typeId 1=テキスト, 2=文章, 3=数値, 4=日付 → 単一値
+        list_types = {5, 6, 7, 8}
+        if type_id in list_types or len(values) > 1:
+            extra[f"customField_{field_id}"] = values  # リスト → []付きで送信
+        else:
+            extra[f"customField_{field_id}"] = values[0]
+
+    return extra
+
+
+# ==============================================================
 # 集計ロジック
 # ==============================================================
 
-def collect_report_data(client: BacklogClient, project_id: int,
-                        week_start: date, week_end: date,
-                        open_status_ids: list, closed_status_ids: list) -> dict:
+def collect_report_data(
+    client: BacklogClient,
+    project_id: int,
+    week_start: date,
+    week_end: date,
+    open_status_ids: list,
+    closed_status_ids: list,
+    extra_params: dict = None,
+) -> dict:
     """
-    週次レポートに必要なデータを集計する
-
-    Returns:
-        dict with keys:
-            carry_over   : 前週からの残件（課題リスト）
-            new_issues   : 新規発生（課題リスト）
-            completed    : 当週完了（課題リスト）
-            incomplete   : 未完了（課題リスト）
+    週次レポートに必要なデータを集計する。
+    extra_params にフィルター（種別・カスタム属性）を渡す。
     """
     ws = week_start.strftime("%Y-%m-%d")
     we = week_end.strftime("%Y-%m-%d")
+    ep = extra_params or {}
 
-    print(f"  対象期間: {ws} 〜 {we}")
-    print("  課題データを取得中...")
-
-    # ① 前週からの残件
-    #    week_start より前に作成され、かつ現在も未完了のもの
-    print("  [1/4] 前週からの残件を取得中...")
+    # ① 前週からの残件（week_start より前に作成され、現在も未完了）
     carry_over_issues = client.get_issues(project_id, {
+        **ep,
         "statusId": open_status_ids,
         "createdUntil": (week_start - timedelta(days=1)).strftime("%Y-%m-%d"),
     })
 
-    # ② 新規発生
-    #    対象週に作成されたすべての課題（ステータス問わず）
-    print("  [2/4] 新規発生課題を取得中...")
+    # ② 新規発生（対象週に作成された課題、ステータス問わず）
     new_issues = client.get_issues(project_id, {
+        **ep,
         "createdSince": ws,
         "createdUntil": we,
     })
 
-    # ③ 当週完了
-    #    対象週に更新（クローズ）された完了ステータスの課題
-    #    ※ Backlog APIには「完了日」フィルタがないため、
-    #      「対象週に更新された完了課題」で近似します
-    print("  [3/4] 当週完了課題を取得中...")
+    # ③ 当週完了（対象週に更新された完了ステータスの課題）
+    #    ※ Backlog APIに「完了日」フィルタがないため updatedSince/Until で近似
     completed_issues = client.get_issues(project_id, {
+        **ep,
         "statusId": closed_status_ids,
         "updatedSince": ws,
         "updatedUntil": we,
     })
 
     # ④ 未完了（現在オープンの全課題）
-    print("  [4/4] 未完了課題を取得中...")
     incomplete_issues = client.get_issues(project_id, {
+        **ep,
         "statusId": open_status_ids,
     })
 
@@ -196,18 +260,18 @@ def collect_report_data(client: BacklogClient, project_id: int,
 # Markdownレポート生成
 # ==============================================================
 
-def format_issue_list(issues: list, project_key: str, max_display: int = 30) -> str:
+def format_issue_table(issues: list, max_display: int = 30) -> str:
     """課題リストをMarkdown表形式にフォーマット"""
     if not issues:
         return "_（該当なし）_\n"
 
-    lines = []
-    lines.append("| 課題番号 | 件名 | ステータス | 担当者 |")
-    lines.append("|---------|------|-----------|-------|")
-
+    lines = [
+        "| 課題番号 | 件名 | ステータス | 担当者 |",
+        "|---------|------|-----------|-------|",
+    ]
     for issue in issues[:max_display]:
         issue_key = issue.get("issueKey", "-")
-        summary = issue.get("summary", "-").replace("|", "｜")  # パイプをエスケープ
+        summary = issue.get("summary", "-").replace("|", "｜")
         status = issue.get("status", {}).get("name", "-")
         assignee = issue.get("assignee")
         assignee_name = assignee.get("name", "-") if assignee else "_未割当_"
@@ -219,8 +283,24 @@ def format_issue_list(issues: list, project_key: str, max_display: int = 30) -> 
     return "\n".join(lines) + "\n"
 
 
-def generate_markdown_report(data: dict, project_key: str, project_name: str,
-                              week_start: date, week_end: date) -> str:
+def keys_str(issues: list) -> str:
+    """課題番号のみのコンパクト表示"""
+    keys = [i.get("issueKey", "?") for i in issues]
+    if not keys:
+        return "_（なし）_"
+    return "、".join(keys[:20]) + (f" 他{len(keys) - 20}件" if len(keys) > 20 else "")
+
+
+def generate_markdown_report(
+    data: dict,
+    project_key: str,
+    project_name: str,
+    week_start: date,
+    week_end: date,
+    filter_name: str = None,
+    filter_description: str = None,
+    filter_summary: str = None,
+) -> str:
     """Markdownレポートを生成"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     ws_str = week_start.strftime("%Y/%m/%d")
@@ -231,17 +311,17 @@ def generate_markdown_report(data: dict, project_key: str, project_name: str,
     completed = data["completed"]
     incomplete = data["incomplete"]
 
-    # 課題番号のみの一覧（コンパクト表示用）
-    def keys_str(issues):
-        keys = [i.get("issueKey", "?") for i in issues]
-        if not keys:
-            return "_（なし）_"
-        return "、".join(keys[:20]) + (f" 他{len(keys)-20}件" if len(keys) > 20 else "")
-
+    title_suffix = f" — {filter_name}" if filter_name else ""
     lines = [
-        f"# 週次レポート — {ws_str} 〜 {we_str}",
+        f"# 週次レポート{title_suffix} — {ws_str} 〜 {we_str}",
         "",
         f"> プロジェクト: **{project_name}** (`{project_key}`)  ",
+    ]
+    if filter_description:
+        lines.append(f"> フィルター: {filter_description}  ")
+    if filter_summary:
+        lines.append(f"> 絞り込み条件: `{filter_summary}`  ")
+    lines += [
         f"> 生成日時: {now}",
         "",
         "---",
@@ -265,7 +345,7 @@ def generate_markdown_report(data: dict, project_key: str, project_name: str,
         "<details>",
         "<summary>詳細一覧を表示</summary>",
         "",
-        format_issue_list(carry_over, project_key),
+        format_issue_table(carry_over),
         "</details>",
         "",
         "---",
@@ -278,7 +358,7 @@ def generate_markdown_report(data: dict, project_key: str, project_name: str,
         "<details>",
         "<summary>詳細一覧を表示</summary>",
         "",
-        format_issue_list(new_issues, project_key),
+        format_issue_table(new_issues),
         "</details>",
         "",
         "---",
@@ -291,7 +371,7 @@ def generate_markdown_report(data: dict, project_key: str, project_name: str,
         "<details>",
         "<summary>詳細一覧を表示</summary>",
         "",
-        format_issue_list(completed, project_key),
+        format_issue_table(completed),
         "</details>",
         "",
         "---",
@@ -304,7 +384,7 @@ def generate_markdown_report(data: dict, project_key: str, project_name: str,
         "<details>",
         "<summary>詳細一覧を表示</summary>",
         "",
-        format_issue_list(incomplete, project_key, max_display=50),
+        format_issue_table(incomplete, max_display=50),
         "</details>",
         "",
         "---",
@@ -313,6 +393,26 @@ def generate_markdown_report(data: dict, project_key: str, project_name: str,
     ]
 
     return "\n".join(lines)
+
+
+def build_filter_summary(filter_cfg: dict) -> str:
+    """フィルター条件の人間向け要約文字列を生成"""
+    parts = []
+    issue_types = filter_cfg.get("issue_types") or []
+    if issue_types:
+        parts.append(f"種別: {', '.join(issue_types)}")
+    for cf in filter_cfg.get("custom_fields") or []:
+        label = cf.get("field_name") or f"field_id={cf.get('field_id')}"
+        vals = cf.get("values") or []
+        parts.append(f"{label}: {', '.join(str(v) for v in vals)}")
+    return " / ".join(parts) if parts else "（なし）"
+
+
+def safe_filename(name: str) -> str:
+    """ファイル名に使えない文字を除去"""
+    for ch in r'\/:*?"<>|　':
+        name = name.replace(ch, "_")
+    return name
 
 
 # ==============================================================
@@ -331,7 +431,8 @@ def load_config(config_path: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Backlog 週次レポート生成")
-    parser.add_argument("--config", default="config.yaml", help="設定ファイルのパス（デフォルト: config.yaml）")
+    parser.add_argument("--config", default="config.yaml",
+                        help="設定ファイルのパス（デフォルト: config.yaml）")
     parser.add_argument("--week", choices=["previous", "current"],
                         help="対象週の指定（設定ファイルの値を上書き）")
     args = parser.parse_args()
@@ -340,6 +441,7 @@ def main():
     config = load_config(args.config)
     backlog_cfg = config.get("backlog", {})
     report_cfg = config.get("report", {})
+    filters_cfg = config.get("filters") or []
 
     space_host = backlog_cfg.get("space_host", "")
     api_key = backlog_cfg.get("api_key", "")
@@ -361,18 +463,17 @@ def main():
     open_status_ids = report_cfg.get("open_status_ids", [1, 2, 3])
     closed_status_ids = report_cfg.get("closed_status_ids", [4])
 
-    # 対象週を計算
     week_start, week_end = get_week_range(target_week, week_start_day)
 
-    print("=" * 50)
+    print("=" * 55)
     print("Backlog 週次レポート生成")
-    print("=" * 50)
-    print(f"スペース: {space_host}")
+    print("=" * 55)
+    print(f"スペース  : {space_host}")
     print(f"プロジェクト: {project_key}")
-    print(f"対象週: {week_start} 〜 {week_end}")
+    print(f"対象週    : {week_start} 〜 {week_end}")
+    print(f"フィルター数: {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
     print()
 
-    # Backlog APIクライアント初期化
     client = BacklogClient(space_host, api_key)
 
     # プロジェクト情報取得
@@ -387,39 +488,91 @@ def main():
     project_id = project["id"]
     project_name = project["name"]
     print(f"プロジェクト名: {project_name} (ID: {project_id})")
+
+    # 種別・カスタム属性マスターを取得（フィルターがある場合のみ）
+    issue_type_map = {}    # {名前: ID}
+    custom_field_map = {}  # {名前: {id, typeId}}
+
+    if filters_cfg:
+        print("種別・カスタム属性マスターを取得中...")
+        try:
+            issue_types = client.get_issue_types(project_key)
+            issue_type_map = {it["name"]: it["id"] for it in issue_types}
+            print(f"  種別: {list(issue_type_map.keys())}")
+        except Exception as e:
+            print(f"  ⚠ 種別マスターの取得に失敗: {e}", file=sys.stderr)
+
+        try:
+            custom_fields = client.get_custom_fields(project_key)
+            custom_field_map = {
+                cf["name"]: {"id": cf["id"], "typeId": cf.get("typeId")}
+                for cf in custom_fields
+            }
+            print(f"  カスタム属性: {list(custom_field_map.keys())}")
+        except Exception as e:
+            print(f"  ⚠ カスタム属性マスターの取得に失敗: {e}", file=sys.stderr)
+
     print()
-
-    # データ収集
-    print("集計データを取得中...")
-    data = collect_report_data(
-        client, project_id,
-        week_start, week_end,
-        open_status_ids, closed_status_ids
-    )
-    print()
-
-    # レポート生成
-    print("レポートを生成中...")
-    report_md = generate_markdown_report(
-        data, project_key, project_name, week_start, week_end
-    )
-
-    # 出力先ディレクトリ作成
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ファイル保存
-    filename = f"weekly_report_{week_start.strftime('%Y%m%d')}_{week_end.strftime('%Y%m%d')}.md"
-    output_path = output_dir / filename
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(report_md)
+    # ---- フィルターなし（filters が空の場合）----
+    if not filters_cfg:
+        print("【フィルターなし】全課題を集計中...")
+        data = collect_report_data(
+            client, project_id, week_start, week_end,
+            open_status_ids, closed_status_ids
+        )
+        report_md = generate_markdown_report(
+            data, project_key, project_name, week_start, week_end
+        )
+        filename = f"weekly_report_{week_start.strftime('%Y%m%d')}_{week_end.strftime('%Y%m%d')}.md"
+        output_path = output_dir / filename
+        output_path.write_text(report_md, encoding="utf-8")
+        _print_summary(output_path, data)
+        return
 
-    print(f"✅ レポートを保存しました: {output_path}")
-    print()
-    print("--- サマリー ---")
-    print(f"  前週からの残件数: {len(data['carry_over'])} 件")
-    print(f"  新規発生件数:     {len(data['new_issues'])} 件")
-    print(f"  当週完了件数:     {len(data['completed'])} 件")
-    print(f"  未完了件数:       {len(data['incomplete'])} 件")
+    # ---- フィルターごとに集計・出力 ----
+    for i, filter_cfg in enumerate(filters_cfg, 1):
+        filter_name = filter_cfg.get("name") or f"filter_{i}"
+        filter_desc = filter_cfg.get("description") or ""
+        filter_summary = build_filter_summary(filter_cfg)
+
+        print(f"[{i}/{len(filters_cfg)}] フィルター「{filter_name}」を集計中...")
+        print(f"         条件: {filter_summary}")
+
+        # フィルターパラメータを解決
+        extra_params = resolve_filter_params(filter_cfg, issue_type_map, custom_field_map)
+
+        data = collect_report_data(
+            client, project_id, week_start, week_end,
+            open_status_ids, closed_status_ids,
+            extra_params=extra_params,
+        )
+
+        report_md = generate_markdown_report(
+            data, project_key, project_name, week_start, week_end,
+            filter_name=filter_name,
+            filter_description=filter_desc,
+            filter_summary=filter_summary,
+        )
+
+        safe_name = safe_filename(filter_name)
+        filename = (
+            f"weekly_report_{week_start.strftime('%Y%m%d')}_"
+            f"{week_end.strftime('%Y%m%d')}_{safe_name}.md"
+        )
+        output_path = output_dir / filename
+        output_path.write_text(report_md, encoding="utf-8")
+        _print_summary(output_path, data)
+        print()
+
+
+def _print_summary(output_path: Path, data: dict) -> None:
+    print(f"  ✅ 保存: {output_path}")
+    print(f"     前週残件: {len(data['carry_over'])} 件 / "
+          f"新規: {len(data['new_issues'])} 件 / "
+          f"完了: {len(data['completed'])} 件 / "
+          f"未完了: {len(data['incomplete'])} 件")
 
 
 if __name__ == "__main__":
