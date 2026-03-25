@@ -493,8 +493,9 @@ def main():
   python backlog_weekly_report.py
 """,
     )
-    parser.add_argument("--config", default="config.yaml",
-                        help="設定ファイルのパス（デフォルト: config.yaml）")
+    default_config = str(Path(__file__).parent / "config.yaml")
+    parser.add_argument("--config", default=default_config,
+                        help=f"設定ファイルのパス（デフォルト: スクリプトと同じディレクトリの config.yaml）")
     parser.add_argument("--week", choices=["previous", "current"],
                         help="対象週の指定（設定ファイルの値を上書き）")
     parser.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD",
