@@ -33,7 +33,9 @@ report:
   # "current"  = 今週（月曜〜今日まで）を集計
   target_week: "previous"
 
-  # 週の開始曜日（"monday" または "sunday"）
+  # 週の開始曜日
+  # 英語: monday, tuesday, wednesday, thursday, friday, saturday, sunday
+  # 日本語: 月, 火, 水, 木, 金, 土, 日（または 月曜, 火曜, ...）
   week_start: "monday"
 
   # レポートの出力先ディレクトリ（相対パスまたは絶対パス）

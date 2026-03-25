@@ -110,20 +110,46 @@ class BacklogClient:
 # 週の日付範囲計算
 # ==============================================================
 
+WEEK_START_MAP = {
+    "monday":    0,
+    "tuesday":   1,
+    "wednesday": 2,
+    "thursday":  3,
+    "friday":    4,
+    "saturday":  5,
+    "sunday":    6,
+    # 日本語でも指定可能
+    "月曜": 0, "月": 0,
+    "火曜": 1, "火": 1,
+    "水曜": 2, "水": 2,
+    "木曜": 3, "木": 3,
+    "金曜": 4, "金": 4,
+    "土曜": 5, "土": 5,
+    "日曜": 6, "日": 6,
+}
+
+
 def get_week_range(target_week: str, week_start: str) -> tuple[date, date]:
     """
     対象週の開始日と終了日を返す（date型）
 
     target_week: "previous" or "current"
-    week_start:  "monday" or "sunday"
+    week_start:  曜日名（"monday"〜"sunday" または "月"〜"日"）
     """
     today = date.today()
 
-    if week_start == "monday":
-        days_since_start = today.weekday()  # 月=0, 日=6
-    else:  # sunday
-        days_since_start = (today.weekday() + 1) % 7
+    start_weekday = WEEK_START_MAP.get(week_start.lower())
+    if start_weekday is None:
+        print(
+            f"エラー: week_start に無効な値 '{week_start}' が指定されています。\n"
+            "  有効な値: monday, tuesday, wednesday, thursday, friday, saturday, sunday\n"
+            "  （日本語も可: 月, 火, 水, 木, 金, 土, 日）",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
+    # 今日から直近の week_start 曜日までの日数
+    days_since_start = (today.weekday() - start_weekday) % 7
     this_week_start = today - timedelta(days=days_since_start)
 
     if target_week == "previous":

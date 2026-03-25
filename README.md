@@ -93,6 +93,15 @@ report:
     to:   "2026-03-31"
 ```
 
+`--week` や `target_week` の自動計算を使う場合は、`week_start` で週の開始曜日を指定できます。
+
+```yaml
+report:
+  # 英語: monday / tuesday / wednesday / thursday / friday / saturday / sunday
+  # 日本語: 月 / 火 / 水 / 木 / 金 / 土 / 日（または 月曜〜日曜）
+  week_start: "monday"
+```
+
 次回の集計期間に変更する際は `from` / `to` の日付を書き換えて実行します。
 `period` をコメントアウトすると `target_week` の自動計算に切り替わります。
 
