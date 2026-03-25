@@ -79,14 +79,33 @@ class BacklogClient:
             with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
                 return json.loads(res.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            if e.code == 401:
-                print(f"エラー: 認証に失敗しました（HTTP 401）。api_key を確認してください。", file=sys.stderr)
+            # レスポンスボディから詳細メッセージを取得
+            detail = ""
+            try:
+                body = json.loads(e.read().decode("utf-8"))
+                errors = body.get("errors", [])
+                if errors:
+                    detail = " / ".join(
+                        f"{err.get('message', '')}（code={err.get('code')}）"
+                        for err in errors
+                    )
+            except Exception:
+                pass
+
+            # エンドポイントのみ表示（APIキーを含むURLは表示しない）
+            print(f"エラー: API呼び出しに失敗しました（HTTP {e.code}）: {endpoint}", file=sys.stderr)
+            if detail:
+                print(f"  詳細: {detail}", file=sys.stderr)
+
+            if e.code == 400:
+                print("  → リクエストパラメータを確認してください。", file=sys.stderr)
+                print("    フィルターの field_name / field_id や values の値が正しいか確認してください。", file=sys.stderr)
+            elif e.code == 401:
+                print("  → api_key を確認してください。", file=sys.stderr)
             elif e.code == 403:
-                print(f"エラー: アクセスが拒否されました（HTTP 403）。api_key の権限を確認してください。", file=sys.stderr)
+                print("  → api_key の権限を確認してください。", file=sys.stderr)
             elif e.code == 404:
-                print(f"エラー: リソースが見つかりません（HTTP 404）。space_host または project_key を確認してください。", file=sys.stderr)
-            else:
-                print(f"エラー: HTTPエラーが発生しました（HTTP {e.code}）: {e.reason}", file=sys.stderr)
+                print("  → space_host または project_key を確認してください。", file=sys.stderr)
             sys.exit(1)
 
     def get_project(self, project_key: str) -> dict:
