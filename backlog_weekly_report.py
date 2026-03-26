@@ -327,6 +327,9 @@ def get_completed_issue_ids_from_project_activities(
         "order": "desc",        # 新しい順
     }
 
+    if client.debug:
+        print(f"  [DEBUG] 完了課題判定: closed_status_names={closed_status_names}", file=sys.stderr)
+
     while True:
         activities = client._get(f"/projects/{project_key}/activities", params)
         if not activities:
@@ -348,12 +351,19 @@ def get_completed_issue_ids_from_project_activities(
             # 対象期間内のみ処理
             if act_date <= week_end:
                 changes = act.get("content", {}).get("changes", [])
+                if client.debug and changes:
+                    key_id = act.get("content", {}).get("key_id", "?")
+                    print(f"  [DEBUG] activity {project_key}-{key_id} ({created_str}): changes={changes}",
+                          file=sys.stderr)
                 for change in changes:
                     if (change.get("field") == "status"
                             and change.get("new_value") in closed_status_names):
                         issue_id = act.get("content", {}).get("id")
                         if issue_id is not None:
                             completed_ids.add(issue_id)
+                            if client.debug:
+                                print(f"  [DEBUG] → 完了と判定: {project_key}-{key_id} (id={issue_id})",
+                                      file=sys.stderr)
 
         if stop or len(activities) < 100:
             break
@@ -391,7 +401,13 @@ def collect_report_data(
         closed_status_names = {
             s["name"] for s in statuses if s["id"] in closed_status_ids
         }
-    except Exception:
+        if client.debug:
+            print(f"  [DEBUG] 取得ステータス一覧: { {s['id']: s['name'] for s in statuses} }",
+                  file=sys.stderr)
+            print(f"  [DEBUG] 完了ステータス名: {closed_status_names}", file=sys.stderr)
+    except Exception as e:
+        if client.debug:
+            print(f"  [DEBUG] ステータス取得失敗: {e}", file=sys.stderr)
         closed_status_names = set()
 
     if closed_status_names:
