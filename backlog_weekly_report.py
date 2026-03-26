@@ -499,6 +499,7 @@ def collect_report_data(
     })
 
     prev_status_map: dict = {}  # {issue_id: 期間開始時点のステータス名}
+    completed_ids: set = set()  # アクティビティで確認された完了課題ID
     if closed_status_names and candidates:
         # Step B: プロジェクトアクティビティで「本当に期間内にステータス変化したか」を検証
         # 偽陽性（完了前に更新されたコメント等）を除外するための絞り込み
@@ -534,7 +535,7 @@ def collect_report_data(
 
     # 「処理中→完了→処理中」のケース: 期間内に完了→再オープン両方を経た課題
     # → 期間開始時は処理中だったので残件に含めるべき → reopened から除外
-    truly_reopened_ids = reopened_ids - completed_ids if completed_ids else reopened_ids
+    truly_reopened_ids = reopened_ids - completed_ids
 
     # ---- ① 前週からの残件 ----
     # 期間開始前に作成され、期間開始前に完了していない課題
