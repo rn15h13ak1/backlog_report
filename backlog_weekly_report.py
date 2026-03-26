@@ -313,107 +313,42 @@ def resolve_filter_params(
 # 集計ロジック
 # ==============================================================
 
-def get_completed_issue_ids_from_project_activities(
-    client: BacklogClient,
-    project_key: str,
-    week_start: date,
-    week_end: date,
-    closed_status_names: set,
-) -> tuple:
-    """
-    /projects/{key}/activities（typeId=2: 課題更新）を降順に取得し、
-    対象期間内にステータスが完了系へ変化した課題の情報を返す。
-
-    Returns:
-        (completed_ids: set, prev_status_map: dict)
-        completed_ids   : 期間内に完了へ変化した課題の数値IDセット
-        prev_status_map : {issue_id: 完了前のステータス名}（期間開始時点のステータス）
-    """
-    completed_ids: set = set()
-    prev_status_map: dict = {}  # {issue_id: 完了前ステータス名}
-    params: dict = {
-        "activityTypeId": [2],  # ISSUE_UPDATED のみ
-        "count": 100,
-        "order": "desc",        # 新しい順
-    }
-
-    if client.debug:
-        print(f"  [DEBUG] 完了課題判定: closed_status_names={closed_status_names}", file=sys.stderr)
-
-    while True:
-        activities = client._get(f"/projects/{project_key}/activities", params)
-        if not activities:
-            break
-
-        stop = False
-        for act in activities:
-            created_str = act.get("created", "")[:10]  # "YYYY-MM-DD"
-            try:
-                act_date = datetime.strptime(created_str, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-
-            # 対象期間より古ければ終了
-            if act_date < week_start:
-                stop = True
-                break
-
-            # 対象期間内のみ処理
-            if act_date <= week_end:
-                changes = act.get("content", {}).get("changes", [])
-                if client.debug and changes:
-                    key_id = act.get("content", {}).get("key_id", "?")
-                    print(f"  [DEBUG] activity {project_key}-{key_id} ({created_str}): changes={changes}",
-                          file=sys.stderr)
-                for change in changes:
-                    if (change.get("field") == "status"
-                            and change.get("new_value") in closed_status_names):
-                        issue_id = act.get("content", {}).get("id")
-                        if issue_id is not None:
-                            completed_ids.add(issue_id)
-                            # 完了前のステータス名を記録（最初に見つかったものを優先）
-                            if issue_id not in prev_status_map:
-                                prev_status_map[issue_id] = change.get("old_value", "処理中")
-                            if client.debug:
-                                print(f"  [DEBUG] → 完了と判定: {project_key}-{key_id} "
-                                      f"(id={issue_id}, "
-                                      f"{change.get('old_value')}→{change.get('new_value')})",
-                                      file=sys.stderr)
-
-        if stop or len(activities) < 100:
-            break
-
-        # 次ページ: 今回取得した中の最小IDより前を取得
-        min_id = min(act["id"] for act in activities)
-        params["maxId"] = min_id - 1
-        time.sleep(0.3)
-
-    return completed_ids, prev_status_map
-
-
-def get_reopened_issue_ids_from_project_activities(
+def scan_issue_status_changes_from_activities(
     client: BacklogClient,
     project_key: str,
     week_start: date,
     week_end: date,
     closed_status_names: set,
     open_status_names: set,
-) -> set:
+) -> tuple:
     """
-    /projects/{key}/activities を降順スキャンし、
-    対象期間内にステータスが「完了系 → オープン系」へ変化した課題IDセットを返す。
-    （= 期間中に再オープンされた課題）
+    /projects/{key}/activities を1回だけ降順スキャンし、
+    対象期間内のステータス変化（完了・再オープン両方）を同時に検出する。
+
+    activityTypeId に [2, 3] を指定することで、Backlogのバージョンによって
+    「課題更新」のtype IDが2か3か異なる場合でも確実に捕捉する。
+
+    Returns:
+        (completed_ids, prev_status_map, reopened_ids)
+        completed_ids   : 期間内に完了系へ変化した課題の数値IDセット
+        prev_status_map : {issue_id: 完了前のステータス名}
+        reopened_ids    : 期間内に完了系→オープン系へ変化した課題の数値IDセット
     """
+    completed_ids: set = set()
+    prev_status_map: dict = {}
     reopened_ids: set = set()
+
     params: dict = {
-        "activityTypeId": [2],
+        "activityTypeId": [2, 3],  # type2=課題更新(cloud), type3=課題更新(on-premise) 両対応
         "count": 100,
         "order": "desc",
     }
 
     if client.debug:
-        print(f"  [DEBUG] 再オープン判定: closed={closed_status_names}, open={open_status_names}",
-              file=sys.stderr)
+        print(f"  [DEBUG] アクティビティスキャン開始: project={project_key}, "
+              f"period={week_start}〜{week_end}", file=sys.stderr)
+        print(f"  [DEBUG] 完了ステータス名: {closed_status_names}", file=sys.stderr)
+        print(f"  [DEBUG] オープンステータス名: {open_status_names}", file=sys.stderr)
 
     while True:
         activities = client._get(f"/projects/{project_key}/activities", params)
@@ -428,25 +363,43 @@ def get_reopened_issue_ids_from_project_activities(
             except ValueError:
                 continue
 
+            # 対象期間より古ければスキャン終了
             if act_date < week_start:
                 stop = True
                 break
 
+            # 対象期間内のみ処理
             if act_date <= week_end:
-                changes = act.get("content", {}).get("changes", [])
+                content = act.get("content", {})
+                issue_id = content.get("id")
+                key_id = content.get("key_id", "?")
+                changes = content.get("changes", [])
+
+                if client.debug and changes:
+                    print(f"  [DEBUG] activity {project_key}-{key_id} ({created_str}): "
+                          f"type={act.get('type')} changes={changes}", file=sys.stderr)
+
                 for change in changes:
-                    if (change.get("field") == "status"
-                            and change.get("old_value") in closed_status_names
-                            and change.get("new_value") in open_status_names):
-                        issue_id = act.get("content", {}).get("id")
-                        if issue_id is not None:
-                            reopened_ids.add(issue_id)
-                            if client.debug:
-                                key_id = act.get("content", {}).get("key_id", "?")
-                                print(f"  [DEBUG] → 再オープンと判定: {project_key}-{key_id} "
-                                      f"(id={issue_id}, "
-                                      f"{change.get('old_value')}→{change.get('new_value')})",
-                                      file=sys.stderr)
+                    if change.get("field") != "status" or issue_id is None:
+                        continue
+                    old_val = change.get("old_value", "")
+                    new_val = change.get("new_value", "")
+
+                    # 完了への変化
+                    if new_val in closed_status_names:
+                        completed_ids.add(issue_id)
+                        if issue_id not in prev_status_map:
+                            prev_status_map[issue_id] = old_val or "処理中"
+                        if client.debug:
+                            print(f"  [DEBUG] → 完了と判定: {project_key}-{key_id} "
+                                  f"(id={issue_id}, {old_val}→{new_val})", file=sys.stderr)
+
+                    # 再オープンへの変化（完了系→オープン系）
+                    if old_val in closed_status_names and new_val in open_status_names:
+                        reopened_ids.add(issue_id)
+                        if client.debug:
+                            print(f"  [DEBUG] → 再オープンと判定: {project_key}-{key_id} "
+                                  f"(id={issue_id}, {old_val}→{new_val})", file=sys.stderr)
 
         if stop or len(activities) < 100:
             break
@@ -455,7 +408,11 @@ def get_reopened_issue_ids_from_project_activities(
         params["maxId"] = min_id - 1
         time.sleep(0.3)
 
-    return reopened_ids
+    if client.debug:
+        print(f"  [DEBUG] スキャン完了: 完了={len(completed_ids)}件, "
+              f"再オープン={len(reopened_ids)}件", file=sys.stderr)
+
+    return completed_ids, prev_status_map, reopened_ids
 
 
 def collect_report_data(
@@ -507,40 +464,34 @@ def collect_report_data(
         "updatedUntil": we,
     })
 
-    prev_status_map: dict = {}  # {issue_id: 期間開始時点のステータス名}
-    completed_ids: set = set()  # アクティビティで確認された完了課題ID
-    if closed_status_names and candidates:
-        # Step B: プロジェクトアクティビティで「本当に期間内にステータス変化したか」を検証
-        # 偽陽性（完了前に更新されたコメント等）を除外するための絞り込み
-        completed_ids, prev_status_map = get_completed_issue_ids_from_project_activities(
-            client, project_key, week_start, week_end, closed_status_names
-        )
-        if completed_ids:
-            # アクティビティで確認できた課題のみに絞り込む
-            completed_issues = [i for i in candidates if i.get("id") in completed_ids]
-            if client.debug:
-                print(f"  [DEBUG] 候補={len(candidates)}件 → アクティビティ検証後={len(completed_issues)}件",
-                      file=sys.stderr)
-        else:
-            # アクティビティが0件 = APIが対応していないか期間内に変化なし
-            # 候補をそのまま使用（偽陽性の可能性はあるが偽陰性よりマシ）
-            completed_issues = candidates
-            if client.debug:
-                print(f"  [DEBUG] アクティビティ0件のためcandidates({len(candidates)}件)を使用",
-                      file=sys.stderr)
-    else:
-        # ステータス名が取れない、または候補が0件の場合はそのまま使用
-        completed_issues = candidates
-    completed_id_set = {i.get("id") for i in completed_issues}
+    prev_status_map: dict = {}
+    completed_ids: set = set()
+    reopened_ids: set = set()
 
-    # ---- ⑤ 再オープン（期間中に完了系→オープン系に変化した課題） ----
-    # アクティビティから期間中に再オープンされた課題IDを検出
+    # Step B: アクティビティを1回だけ走査し、完了・再オープン両方を同時に検出
     if closed_status_names and open_status_names:
-        reopened_ids = get_reopened_issue_ids_from_project_activities(
+        completed_ids, prev_status_map, reopened_ids = scan_issue_status_changes_from_activities(
             client, project_key, week_start, week_end, closed_status_names, open_status_names
         )
+    elif closed_status_names:
+        # open_status_names が空の場合（設定異常）でも完了だけは検出
+        completed_ids, prev_status_map, _ = scan_issue_status_changes_from_activities(
+            client, project_key, week_start, week_end, closed_status_names, set()
+        )
+
+    if completed_ids:
+        completed_issues = [i for i in candidates if i.get("id") in completed_ids]
+        if client.debug:
+            print(f"  [DEBUG] 候補={len(candidates)}件 → アクティビティ検証後={len(completed_issues)}件",
+                  file=sys.stderr)
     else:
-        reopened_ids = set()
+        # アクティビティで完了が0件 = APIが非対応か期間内に変化なし → candidatesをフォールバック使用
+        completed_issues = candidates
+        if client.debug:
+            print(f"  [DEBUG] アクティビティ完了0件のためcandidates({len(candidates)}件)を使用",
+                  file=sys.stderr)
+
+    completed_id_set = {i.get("id") for i in completed_issues}
 
     # 「処理中→完了→処理中」のケース: 期間内に完了→再オープン両方を経た課題
     # → 期間開始時は処理中だったので残件に含めるべき → reopened から除外
