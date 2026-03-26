@@ -19,7 +19,7 @@ host      = bl["space_host"]
 api_key   = bl["api_key"]
 base_path = ("/" + bl.get("base_path", "").strip("/")) if bl.get("base_path", "").strip("/") else ""
 ssl_verify = bl.get("ssl_verify", True)
-project_key = config["projects"][0]["project_key"]
+project_key = bl["project_key"]
 
 base_url = f"https://{host}{base_path}/api/v2"
 
