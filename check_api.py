@@ -74,8 +74,11 @@ except Exception as e:
     print("  → project_key を確認してください")
     sys.exit(1)
 project_id = project.get("id")
-# 課題一覧は /issues?projectId[]=数値ID で取得（/projects/{key}/issues ではない）
-issues = get("/issues", {"projectId": [project_id], "count": 1})
+# ステータス変化を確認しやすいよう完了済み課題を優先して取得
+issues = get("/issues", {"projectId": [project_id], "statusId": closed_status_ids, "count": 1})
+if not issues:
+    # 完了済みがなければ全ステータスで取得
+    issues = get("/issues", {"projectId": [project_id], "count": 1})
 if not issues:
     print("課題が1件も見つかりませんでした。")
     sys.exit(1)
@@ -83,7 +86,7 @@ if not issues:
 issue = issues[0]
 issue_id  = issue["id"]
 issue_key = issue["issueKey"]
-print(f"取得した課題: {issue_key} (id={issue_id})")
+print(f"取得した課題: {issue_key} (id={issue_id}, status={issue.get('status', {}).get('name')})")
 print()
 
 # Step2: /issues/{id}/activities を試す
@@ -100,7 +103,7 @@ print()
 # Step3: /issues/{id}/comments を試す（changeLog にステータス変化が含まれる可能性）
 print("=== Step3: /issues/{id}/comments エンドポイント確認 ===")
 try:
-    comments = get(f"/issues/{issue_id}/comments", {"count": 5, "order": "desc"})
+    comments = get(f"/issues/{issue_id}/comments", {"count": 20, "order": "desc"})
     print(f"✅ エンドポイント有効。取得件数: {len(comments)}")
     status_changes = []
     for c in comments:
@@ -116,6 +119,11 @@ try:
         for sc in status_changes:
             print(f"     {sc['date']}: {sc['from']} → {sc['to']}")
     else:
-        print("   直近5コメント内にステータス変化なし（課題を変えて再確認が必要な場合あり）")
+        print("   直近20コメント内にステータス変化なし")
+        print("   ※ changeLog フィールドの有無を確認します")
+        has_changelog = any("changeLog" in c for c in comments)
+        print(f"   changeLog フィールド: {'あり' if has_changelog else 'なし（コメント構造が異なる可能性）'}")
+        if comments:
+            print(f"   コメント構造サンプル: {list(comments[0].keys())}")
 except Exception as e:
     print(f"❌ エンドポイント無効またはエラー: {e}")
