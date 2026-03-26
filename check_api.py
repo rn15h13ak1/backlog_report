@@ -21,6 +21,10 @@ base_path = ("/" + bl.get("base_path", "").strip("/")) if bl.get("base_path", ""
 ssl_verify = bl.get("ssl_verify", True)
 project_key = bl["project_key"]
 
+report_cfg = config.get("report", {})
+closed_status_ids = report_cfg.get("closed_status_ids", [3, 4])
+open_status_ids   = report_cfg.get("open_status_ids",   [1, 2])
+
 base_url = f"https://{host}{base_path}/api/v2"
 
 # SSL設定
