@@ -34,7 +34,14 @@ else:
 def get(endpoint, params=None):
     params = params or {}
     params["apiKey"] = api_key
-    qs = "&".join(f"{urllib.parse.quote(k)}={urllib.parse.quote(str(v))}" for k, v in params.items())
+    parts = []
+    for k, v in params.items():
+        if isinstance(v, list):
+            for item in v:
+                parts.append(f"{urllib.parse.quote(k)}%5B%5D={urllib.parse.quote(str(item))}")
+        else:
+            parts.append(f"{urllib.parse.quote(k)}={urllib.parse.quote(str(v))}")
+    qs = "&".join(parts)
     url = f"{base_url}{endpoint}?{qs}"
     print(f"  → {endpoint}?{qs.replace(api_key, '***')}")
     req = urllib.request.Request(url)
@@ -66,7 +73,9 @@ except Exception as e:
     print(f"❌ プロジェクト取得失敗: {e}")
     print("  → project_key を確認してください")
     sys.exit(1)
-issues = get(f"/projects/{project_key}/issues", {"count": 1})
+project_id = project.get("id")
+# 課題一覧は /issues?projectId[]=数値ID で取得（/projects/{key}/issues ではない）
+issues = get("/issues", {"projectId": [project_id], "count": 1})
 if not issues:
     print("課題が1件も見つかりませんでした。")
     sys.exit(1)
