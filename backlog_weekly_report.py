@@ -410,28 +410,38 @@ def collect_report_data(
             print(f"  [DEBUG] ステータス取得失敗: {e}", file=sys.stderr)
         closed_status_names = set()
 
-    if closed_status_names:
-        # プロジェクトアクティビティから期間内に完了へ変化した課題IDを収集
+    # Step A: updatedSince/Until + 完了ステータスで候補を取得
+    # 「処理中→処理済み」のようなステータス変化は必ず updated が更新されるため
+    # このアプローチで確実に捕捉できる（偽陰性なし）
+    candidates = client.get_issues(project_id, {
+        **ep,
+        "statusId": closed_status_ids,
+        "updatedSince": ws,
+        "updatedUntil": we,
+    })
+
+    if closed_status_names and candidates:
+        # Step B: プロジェクトアクティビティで「本当に期間内にステータス変化したか」を検証
+        # 偽陽性（完了前に更新されたコメント等）を除外するための絞り込み
         completed_ids = get_completed_issue_ids_from_project_activities(
             client, project_key, week_start, week_end, closed_status_names
         )
-        # 現在も完了ステータスの全課題を取得し、IDで絞り込む
         if completed_ids:
-            all_closed = client.get_issues(project_id, {
-                **ep,
-                "statusId": closed_status_ids,
-            })
-            completed_issues = [i for i in all_closed if i.get("id") in completed_ids]
+            # アクティビティで確認できた課題のみに絞り込む
+            completed_issues = [i for i in candidates if i.get("id") in completed_ids]
+            if client.debug:
+                print(f"  [DEBUG] 候補={len(candidates)}件 → アクティビティ検証後={len(completed_issues)}件",
+                      file=sys.stderr)
         else:
-            completed_issues = []
+            # アクティビティが0件 = APIが対応していないか期間内に変化なし
+            # 候補をそのまま使用（偽陽性の可能性はあるが偽陰性よりマシ）
+            completed_issues = candidates
+            if client.debug:
+                print(f"  [DEBUG] アクティビティ0件のためcandidates({len(candidates)}件)を使用",
+                      file=sys.stderr)
     else:
-        # ステータス名が取れない場合は updatedSince/Until で近似（フォールバック）
-        completed_issues = client.get_issues(project_id, {
-            **ep,
-            "statusId": closed_status_ids,
-            "updatedSince": ws,
-            "updatedUntil": we,
-        })
+        # ステータス名が取れない、または候補が0件の場合はそのまま使用
+        completed_issues = candidates
     completed_id_set = {i.get("id") for i in completed_issues}
 
     # ---- ① 前週からの残件 ----
