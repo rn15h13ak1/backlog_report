@@ -163,6 +163,15 @@ class BacklogClient:
 
         return all_issues
 
+    def get_issue_by_id(self, issue_id: int) -> dict | None:
+        """課題IDで単一課題を取得。取得失敗時は None を返す"""
+        try:
+            return self._get(f"/issues/{issue_id}")
+        except Exception as e:
+            if self.debug:
+                print(f"  [DEBUG] get_issue_by_id({issue_id}) 失敗: {e}", file=sys.stderr)
+            return None
+
 
 # ==============================================================
 # 週の日付範囲計算
@@ -581,7 +590,8 @@ def collect_report_data(
     for i in carry_over_open_raw:
         if i.get("id") in truly_reopened_ids:
             reopened_map[i.get("id")] = i
-    # 取得できていないIDはAPIで取得（期間前作成でない再オープン課題）
+    # carry_over_open_raw に含まれなかったIDを補完
+    # （現在が完了ステータスの場合や期間中に作成された場合など）
     missing_ids = truly_reopened_ids - set(reopened_map.keys())
     if missing_ids:
         # 新規課題の中にある場合
@@ -589,6 +599,23 @@ def collect_report_data(
             if i.get("id") in missing_ids:
                 reopened_map[i.get("id")] = i
                 missing_ids.discard(i.get("id"))
+    if missing_ids:
+        # candidates（期間中に更新された完了課題）の中にある場合
+        for i in candidates:
+            if i.get("id") in missing_ids:
+                reopened_map[i.get("id")] = i
+                missing_ids.discard(i.get("id"))
+    if missing_ids:
+        # 上記いずれにも存在しない場合（例: 期間中に再オープン→期間後に再完了）
+        # 個別APIで直接取得する
+        for iid in list(missing_ids):
+            issue = client.get_issue_by_id(iid)
+            if issue:
+                reopened_map[iid] = issue
+                if client.debug:
+                    print(f"  [DEBUG] 再オープン課題を個別取得: id={iid} "
+                          f"({issue.get('issueKey')}, 現在={issue.get('status', {}).get('name')})",
+                          file=sys.stderr)
     reopened_issues = list(reopened_map.values())
 
     # ---- ④ 当週未完了 ----
