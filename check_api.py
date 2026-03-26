@@ -58,6 +58,7 @@ print()
 
 # Step1: プロジェクト情報を取得して project_id と issue を1件取得
 print("=== Step1: 課題を1件取得 ===")
+print(f"  project_key の値: [{project_key}]")
 try:
     project = get(f"/projects/{project_key}")
     print(f"✅ プロジェクト取得OK: {project.get('name')} (id={project.get('id')})")
