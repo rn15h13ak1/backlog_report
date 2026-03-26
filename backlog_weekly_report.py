@@ -502,6 +502,10 @@ def collect_report_data(
             status_id_to_name,
         )
 
+    # candidates を ID→課題オブジェクトのマップに変換（①・⑤で共通参照できる共有データ）
+    candidates_map = {i.get("id"): i for i in candidates}
+
+    # ---- ③ 当週完了 ----
     if completed_ids:
         completed_issues = [i for i in candidates if i.get("id") in completed_ids]
         if client.debug:
@@ -516,31 +520,42 @@ def collect_report_data(
 
     completed_id_set = {i.get("id") for i in completed_issues}
 
-    # 「処理中→完了→処理中」のケース: 期間内に完了→再オープン両方を経た課題
-    # → 期間開始時は処理中だったので残件に含めるべき → reopened から除外
+    # 「処理中→完了→処理中」のケース: 期間内に完了・再オープン両方を経た課題
+    # → 期間開始時はオープンだった残件 → ⑤再オープンから除外して①残件に含める
+    # （completed_ids はアクティビティスキャンの共有結果。③ completed_issues リストには依存しない）
     truly_reopened_ids = reopened_ids - completed_ids
 
     # ---- ① 前週からの残件 ----
-    # 期間開始前に作成され、期間開始前に完了していない課題
-    #   = 現在もオープンで期間前に作成された課題（ただし再オープン課題は除外）
-    #   + 期間中に完了したが期間前に作成された課題（期間開始時はオープンだった）
+    # carry_over_open: 現在オープン＋期間前作成の課題
+    # アクティビティなし課題は「現在ステータス＝期間中ステータス」のため現在のステータスで代替
+    # （これは①に必要な工夫。フィルター項目 **ep は最新情報を使用）
+    # 補足: 期間中にオープンだったが期間後に完了した課題は現在のステータスでは検知できない既知の限界
     carry_over_open_raw = client.get_issues(project_id, {
         **ep,
         "statusId": open_status_ids,
         "createdUntil": (week_start - timedelta(days=1)).strftime("%Y-%m-%d"),
     })
-    # 期間開始前に完了済みだったが期間中に再オープンされた課題は残件から除外
     carry_over_open = [i for i in carry_over_open_raw if i.get("id") not in truly_reopened_ids]
 
-    # 期間中に完了した課題のうち期間前に作成されたもの
-    # → 表示ステータスを「期間開始時点のステータス」に差し替える
+    # carry_over_completed: アクティビティの completed_ids を直接参照（③ completed_issues リストに非依存）
+    # candidates_map で高速ルックアップ、存在しない場合は個別 API でフォールバック取得
     carry_over_completed = []
-    for i in completed_issues:
-        if i.get("created", "")[:10] < ws:
-            issue_copy = {**i}
-            prev_name = prev_status_map.get(i.get("id"), "処理中")
+    for cid in completed_ids:
+        issue = candidates_map.get(cid)
+        if issue is None:
+            issue = client.get_issue_by_id(cid)
+            if client.debug and issue:
+                print(f"  [DEBUG] carry_over_completed 個別取得: id={cid} "
+                      f"({issue.get('issueKey')}, 現在={issue.get('status', {}).get('name')})",
+                      file=sys.stderr)
+        if issue is None:
+            continue
+        if issue.get("created", "")[:10] < ws:
+            issue_copy = {**issue}
+            prev_name = prev_status_map.get(cid, "処理中")
             issue_copy["status"] = {**issue_copy.get("status", {}), "name": prev_name}
             carry_over_completed.append(issue_copy)
+
     # 重複排除してマージ
     seen_ids = set()
     carry_over_issues = []
@@ -556,41 +571,28 @@ def collect_report_data(
         "createdSince": ws,
         "createdUntil": we,
     })
+    new_issues_map = {i.get("id"): i for i in new_issues}
 
-    # ---- ⑤ 再オープン課題の詳細取得 ----
-    # truly_reopened_ids に対応する課題オブジェクトを収集
-    # （carry_over_open_raw から取得済みのもの + 別途取得）
-    reopened_map: dict = {}
-    for i in carry_over_open_raw:
-        if i.get("id") in truly_reopened_ids:
-            reopened_map[i.get("id")] = i
-    # carry_over_open_raw に含まれなかったIDを補完
-    # （現在が完了ステータスの場合や期間中に作成された場合など）
-    missing_ids = truly_reopened_ids - set(reopened_map.keys())
-    if missing_ids:
-        # 新規課題の中にある場合
-        for i in new_issues:
-            if i.get("id") in missing_ids:
-                reopened_map[i.get("id")] = i
-                missing_ids.discard(i.get("id"))
-    if missing_ids:
-        # candidates（期間中に更新された完了課題）の中にある場合
-        for i in candidates:
-            if i.get("id") in missing_ids:
-                reopened_map[i.get("id")] = i
-                missing_ids.discard(i.get("id"))
-    if missing_ids:
-        # 上記いずれにも存在しない場合（例: 期間中に再オープン→期間後に再完了）
-        # 個別APIで直接取得する
-        for iid in list(missing_ids):
-            issue = client.get_issue_by_id(iid)
-            if issue:
-                reopened_map[iid] = issue
-                if client.debug:
-                    print(f"  [DEBUG] 再オープン課題を個別取得: id={iid} "
-                          f"({issue.get('issueKey')}, 現在={issue.get('status', {}).get('name')})",
-                          file=sys.stderr)
-    reopened_issues = list(reopened_map.values())
+    # ---- ⑤ 再オープン（アクティビティから直接検知、③ completed_issues リストに非依存） ----
+    # truly_reopened_ids の課題オブジェクトを収集
+    # candidates_map（ステータス変化あり）→ carry_over_open_raw → new_issues → 個別 API の順で参照
+    carry_over_open_map = {i.get("id"): i for i in carry_over_open_raw}
+    reopened_issues_map: dict = {}
+    for rid in truly_reopened_ids:
+        issue = (
+            candidates_map.get(rid)
+            or carry_over_open_map.get(rid)
+            or new_issues_map.get(rid)
+        )
+        if issue is None:
+            issue = client.get_issue_by_id(rid)
+            if client.debug and issue:
+                print(f"  [DEBUG] 再オープン課題を個別取得: id={rid} "
+                      f"({issue.get('issueKey')}, 現在={issue.get('status', {}).get('name')})",
+                      file=sys.stderr)
+        if issue:
+            reopened_issues_map[rid] = issue
+    reopened_issues = list(reopened_issues_map.values())
 
     # ---- ④ 当週未完了 ----
     # 期間最終日時点でオープンの課題 = (残件 + 新規 + 再オープン) - 完了
