@@ -172,6 +172,34 @@ class BacklogClient:
                 print(f"  [DEBUG] get_issue_by_id({issue_id}) 失敗: {e}", file=sys.stderr)
             return None
 
+    def get_issue_comments(self, issue_id: int) -> list:
+        """
+        課題のコメントを全件取得（ページネーション対応）。
+        コメントの changeLog にステータス変化履歴が含まれる。
+        """
+        all_comments = []
+        min_id = None
+
+        while True:
+            params: dict = {"count": 100, "order": "asc"}
+            if min_id is not None:
+                params["minId"] = min_id
+            try:
+                comments = self._get(f"/issues/{issue_id}/comments", params)
+            except Exception as e:
+                if self.debug:
+                    print(f"  [DEBUG] get_issue_comments({issue_id}) 失敗: {e}", file=sys.stderr)
+                break
+            if not comments:
+                break
+            all_comments.extend(comments)
+            if len(comments) < 100:
+                break
+            min_id = max(c["id"] for c in comments) + 1
+            time.sleep(0.3)
+
+        return all_comments
+
 
 # ==============================================================
 # 週の日付範囲計算
@@ -313,6 +341,84 @@ def resolve_filter_params(
 # 集計ロジック
 # ==============================================================
 
+def classify_issue_from_comments(
+    issue: dict,
+    comments: list,
+    week_start: date,
+    week_end: date,
+    closed_status_names: set,
+    open_status_names: set,
+) -> dict:
+    """
+    課題のコメント履歴（changeLog）を基に、対象期間における①〜⑤の分類を返す。
+
+    各カテゴリは独立して判定され、現在のステータスに依存しない。
+    期間開始時点のステータスはコメント履歴から正確に導出する。
+
+    Returns:
+        is_carry_over   : ① 期間前作成かつ期間開始時オープン
+        is_new          : ② 期間中作成
+        is_completed    : ③ 期間中に完了系ステータスへ変化
+        is_reopened     : ⑤ 期間開始時は完了系かつ期間中にオープン系へ変化
+        status_at_start : 期間開始時点のステータス名
+    """
+    ws = week_start.strftime("%Y-%m-%d")
+    we = week_end.strftime("%Y-%m-%d")
+    created = issue.get("created", "")[:10]
+
+    # コメントの changeLog からステータス変化を抽出（コメントは昇順で渡される前提）
+    changes_before: list = []  # 期間前のステータス変化
+    changes_in: list = []      # 期間中のステータス変化
+
+    for comment in comments:
+        comment_date = comment.get("created", "")[:10]
+        for cl in comment.get("changeLog", []):
+            if cl.get("field") != "status":
+                continue
+            entry = {
+                "date": comment_date,
+                "from": cl.get("originalValue", ""),
+                "to":   cl.get("newValue", ""),
+            }
+            if comment_date < ws:
+                changes_before.append(entry)
+            elif comment_date <= we:
+                changes_in.append(entry)
+
+    # 期間開始時点のステータスを確定
+    # ・期間前に変化あり  → 最後の変化の to が期間開始時ステータス
+    # ・期間中に初めて変化 → 最初の変化の from が期間開始時ステータス（変化前）
+    # ・変化なし         → 現在のステータス（期間中も同じだったため）
+    if changes_before:
+        status_at_start = changes_before[-1]["to"]
+    elif changes_in:
+        status_at_start = changes_in[0]["from"]
+    else:
+        status_at_start = issue.get("status", {}).get("name", "")
+
+    is_pre_period = created < ws
+    is_new        = ws <= created <= we
+
+    # 期間開始時ステータスの分類（期間前作成の課題のみ意味を持つ）
+    was_open_at_start   = is_pre_period and (status_at_start in open_status_names)
+    was_closed_at_start = is_pre_period and (status_at_start in closed_status_names)
+
+    # 期間中の変化
+    completed_during = any(c["to"] in closed_status_names for c in changes_in)
+    reopened_during  = any(
+        c["from"] in closed_status_names and c["to"] in open_status_names
+        for c in changes_in
+    )
+
+    return {
+        "is_carry_over":   was_open_at_start,                        # ①
+        "is_new":          is_new,                                    # ②
+        "is_completed":    completed_during,                          # ③
+        "is_reopened":     was_closed_at_start and reopened_during,  # ⑤
+        "status_at_start": status_at_start,
+    }
+
+
 def scan_issue_status_changes_from_activities(
     client: BacklogClient,
     project_key: str,
@@ -448,166 +554,109 @@ def collect_report_data(
 ) -> dict:
     """
     週次レポートに必要なデータを集計する。
-    extra_params にフィルター（種別・カスタム属性）を渡す。
+
+    各課題のコメント履歴（changeLog）を基にステータス変化を判定し、
+    現在のステータスに依存しない過去期間の正確な集計を実現する。
+    フィルター項目（extra_params）は最新の課題属性を使用する。
+
+    処理フロー:
+      1. 最新属性でフィルターした全対象課題を取得（statusId 不問）
+      2. 各課題のコメントを取得してステータス変化履歴を構築
+      3. classify_issue_from_comments で①〜⑤を独立判定
+      4. ④当週未完了 = (①+②+⑤) - ③ で計算
     """
     ws = week_start.strftime("%Y-%m-%d")
     we = week_end.strftime("%Y-%m-%d")
     ep = extra_params or {}
 
-    # ---- ③ 当週完了（先に計算。①の残件判定に使用する） ----
-    # プロジェクトアクティビティで期間内のステータス変化を正確に判定
+    # ステータス名の取得（changeLog の値との照合に使用）
     try:
         statuses = client.get_statuses(project_key)
-        closed_status_names = {
-            s["name"] for s in statuses if s["id"] in closed_status_ids
-        }
-        open_status_names = {
-            s["name"] for s in statuses if s["id"] in open_status_ids
-        }
-        # IDを文字列キーにしたステータス名マップ（アクティビティのID→名前解決用）
-        status_id_to_name = {str(s["id"]): s["name"] for s in statuses}
+        closed_status_names = {s["name"] for s in statuses if s["id"] in closed_status_ids}
+        open_status_names   = {s["name"] for s in statuses if s["id"] in open_status_ids}
         if client.debug:
-            print(f"  [DEBUG] 取得ステータス一覧: { {s['id']: s['name'] for s in statuses} }",
-                  file=sys.stderr)
             print(f"  [DEBUG] 完了ステータス名: {closed_status_names}", file=sys.stderr)
             print(f"  [DEBUG] オープンステータス名: {open_status_names}", file=sys.stderr)
     except Exception as e:
         if client.debug:
             print(f"  [DEBUG] ステータス取得失敗: {e}", file=sys.stderr)
         closed_status_names = set()
-        open_status_names = set()
-        status_id_to_name = {}
+        open_status_names   = set()
 
-    # Step A: updatedSince/Until + 完了ステータスで候補を取得
-    # 「処理中→処理済み」のようなステータス変化は必ず updated が更新されるため
-    # このアプローチで確実に捕捉できる（偽陰性なし）
-    candidates = client.get_issues(project_id, {
+    # ---- 全対象課題を取得（最新属性でフィルター、ステータス不問） ----
+    # createdUntil = week_end で期間終了日以前に作成された課題を対象とする
+    all_issues = client.get_issues(project_id, {
         **ep,
-        "statusId": closed_status_ids,
-        "updatedSince": ws,
-        "updatedUntil": we,
-    })
-
-    prev_status_map: dict = {}
-    completed_ids: set = set()
-    reopened_ids: set = set()
-
-    # Step B: アクティビティを1回だけ走査し、完了・再オープン両方を同時に検出
-    # old_value/new_value がステータス名またはID（文字列）のどちらでも照合できるよう両方渡す
-    if closed_status_names or closed_status_ids:
-        completed_ids, prev_status_map, reopened_ids = scan_issue_status_changes_from_activities(
-            client, project_key, week_start, week_end,
-            closed_status_names, open_status_names,
-            closed_status_ids, open_status_ids,
-            status_id_to_name,
-        )
-
-    # candidates を ID→課題オブジェクトのマップに変換（①・⑤で共通参照できる共有データ）
-    candidates_map = {i.get("id"): i for i in candidates}
-
-    # ---- ③ 当週完了 ----
-    if completed_ids:
-        completed_issues = [i for i in candidates if i.get("id") in completed_ids]
-        if client.debug:
-            print(f"  [DEBUG] 候補={len(candidates)}件 → アクティビティ検証後={len(completed_issues)}件",
-                  file=sys.stderr)
-    else:
-        # アクティビティで完了が0件 = APIが非対応か期間内に変化なし → candidatesをフォールバック使用
-        completed_issues = candidates
-        if client.debug:
-            print(f"  [DEBUG] アクティビティ完了0件のためcandidates({len(candidates)}件)を使用",
-                  file=sys.stderr)
-
-    completed_id_set = {i.get("id") for i in completed_issues}
-
-    # 「処理中→完了→処理中」のケース: 期間内に完了・再オープン両方を経た課題
-    # → 期間開始時はオープンだった残件 → ⑤再オープンから除外して①残件に含める
-    # （completed_ids はアクティビティスキャンの共有結果。③ completed_issues リストには依存しない）
-    truly_reopened_ids = reopened_ids - completed_ids
-
-    # ---- ① 前週からの残件 ----
-    # carry_over_open: 現在オープン＋期間前作成の課題
-    # アクティビティなし課題は「現在ステータス＝期間中ステータス」のため現在のステータスで代替
-    # （これは①に必要な工夫。フィルター項目 **ep は最新情報を使用）
-    # 補足: 期間中にオープンだったが期間後に完了した課題は現在のステータスでは検知できない既知の限界
-    carry_over_open_raw = client.get_issues(project_id, {
-        **ep,
-        "statusId": open_status_ids,
-        "createdUntil": (week_start - timedelta(days=1)).strftime("%Y-%m-%d"),
-    })
-    carry_over_open = [i for i in carry_over_open_raw if i.get("id") not in truly_reopened_ids]
-
-    # carry_over_completed: アクティビティの completed_ids を直接参照（③ completed_issues リストに非依存）
-    # candidates_map で高速ルックアップ、存在しない場合は個別 API でフォールバック取得
-    carry_over_completed = []
-    for cid in completed_ids:
-        issue = candidates_map.get(cid)
-        if issue is None:
-            issue = client.get_issue_by_id(cid)
-            if client.debug and issue:
-                print(f"  [DEBUG] carry_over_completed 個別取得: id={cid} "
-                      f"({issue.get('issueKey')}, 現在={issue.get('status', {}).get('name')})",
-                      file=sys.stderr)
-        if issue is None:
-            continue
-        if issue.get("created", "")[:10] < ws:
-            issue_copy = {**issue}
-            prev_name = prev_status_map.get(cid, "処理中")
-            issue_copy["status"] = {**issue_copy.get("status", {}), "name": prev_name}
-            carry_over_completed.append(issue_copy)
-
-    # 重複排除してマージ
-    seen_ids = set()
-    carry_over_issues = []
-    for i in carry_over_open + carry_over_completed:
-        iid = i.get("id")
-        if iid not in seen_ids:
-            seen_ids.add(iid)
-            carry_over_issues.append(i)
-
-    # ---- ② 新規発生（対象期間に作成された課題、ステータス問わず） ----
-    new_issues = client.get_issues(project_id, {
-        **ep,
-        "createdSince": ws,
         "createdUntil": we,
     })
-    new_issues_map = {i.get("id"): i for i in new_issues}
+    if client.debug:
+        print(f"  [DEBUG] 全対象課題数: {len(all_issues)}件", file=sys.stderr)
 
-    # ---- ⑤ 再オープン（アクティビティから直接検知、③ completed_issues リストに非依存） ----
-    # truly_reopened_ids の課題オブジェクトを収集
-    # candidates_map（ステータス変化あり）→ carry_over_open_raw → new_issues → 個別 API の順で参照
-    carry_over_open_map = {i.get("id"): i for i in carry_over_open_raw}
-    reopened_issues_map: dict = {}
-    for rid in truly_reopened_ids:
-        issue = (
-            candidates_map.get(rid)
-            or carry_over_open_map.get(rid)
-            or new_issues_map.get(rid)
+    all_issues_map = {i.get("id"): i for i in all_issues}
+
+    # ---- 各課題をコメント履歴から独立分類（①〜⑤） ----
+    carry_over_issues: list = []
+    new_issues:        list = []
+    completed_issues:  list = []
+    reopened_issues:   list = []
+
+    for issue in all_issues:
+        issue_id_val = issue.get("id")
+
+        # コメント取得（ステータス変化履歴を含む）
+        comments = client.get_issue_comments(issue_id_val)
+
+        result = classify_issue_from_comments(
+            issue, comments, week_start, week_end,
+            closed_status_names, open_status_names,
         )
-        if issue is None:
-            issue = client.get_issue_by_id(rid)
-            if client.debug and issue:
-                print(f"  [DEBUG] 再オープン課題を個別取得: id={rid} "
-                      f"({issue.get('issueKey')}, 現在={issue.get('status', {}).get('name')})",
-                      file=sys.stderr)
-        if issue:
-            reopened_issues_map[rid] = issue
-    reopened_issues = list(reopened_issues_map.values())
 
-    # ---- ④ 当週未完了 ----
-    # 期間最終日時点でオープンの課題 = (残件 + 新規 + 再オープン) - 完了
-    all_issues_map = {}
-    for i in carry_over_issues + new_issues + reopened_issues:
-        all_issues_map[i.get("id")] = i
-    incomplete_ids = set(all_issues_map.keys()) - completed_id_set
-    incomplete_issues = [all_issues_map[iid] for iid in incomplete_ids]
+        if client.debug:
+            print(
+                f"  [DEBUG] {issue.get('issueKey','?')}: "
+                f"carry={result['is_carry_over']}, new={result['is_new']}, "
+                f"completed={result['is_completed']}, reopened={result['is_reopened']}, "
+                f"status_at_start={result['status_at_start']}",
+                file=sys.stderr,
+            )
+
+        # ① 前週残件
+        if result["is_carry_over"]:
+            if result["is_completed"]:
+                # 表示ステータスを期間開始時点のステータスに差し替え
+                issue_copy = {**issue}
+                issue_copy["status"] = {
+                    **issue_copy.get("status", {}),
+                    "name": result["status_at_start"],
+                }
+                carry_over_issues.append(issue_copy)
+            else:
+                carry_over_issues.append(issue)
+
+        # ② 新規発生
+        if result["is_new"]:
+            new_issues.append(issue)
+
+        # ③ 当週完了
+        if result["is_completed"]:
+            completed_issues.append(issue)
+
+        # ⑤ 再オープン
+        if result["is_reopened"]:
+            reopened_issues.append(issue)
+
+    # ---- ④ 当週未完了 = (① + ② + ⑤) - ③ ----
+    completed_id_set = {i.get("id") for i in completed_issues}
+    active_ids       = {i.get("id") for i in carry_over_issues + new_issues + reopened_issues}
+    incomplete_ids   = active_ids - completed_id_set
+    incomplete_issues = [all_issues_map[iid] for iid in incomplete_ids if iid in all_issues_map]
 
     return {
         "carry_over": carry_over_issues,
         "new_issues": new_issues,
-        "completed": completed_issues,
+        "completed":  completed_issues,
         "incomplete": incomplete_issues,
-        "reopened": reopened_issues,
+        "reopened":   reopened_issues,
     }
 
 
