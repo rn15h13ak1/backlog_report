@@ -95,3 +95,27 @@ try:
         print(f"   サンプル: type={activities[0].get('type')}, created={activities[0].get('created', '')[:10]}")
 except Exception as e:
     print(f"❌ エンドポイント無効またはエラー: {e}")
+print()
+
+# Step3: /issues/{id}/comments を試す（changeLog にステータス変化が含まれる可能性）
+print("=== Step3: /issues/{id}/comments エンドポイント確認 ===")
+try:
+    comments = get(f"/issues/{issue_id}/comments", {"count": 5, "order": "desc"})
+    print(f"✅ エンドポイント有効。取得件数: {len(comments)}")
+    status_changes = []
+    for c in comments:
+        for cl in c.get("changeLog", []):
+            if cl.get("field") == "status":
+                status_changes.append({
+                    "date": c.get("created", "")[:10],
+                    "from": cl.get("originalValue"),
+                    "to":   cl.get("newValue"),
+                })
+    if status_changes:
+        print(f"   ステータス変化の記録あり（直近{len(status_changes)}件）:")
+        for sc in status_changes:
+            print(f"     {sc['date']}: {sc['from']} → {sc['to']}")
+    else:
+        print("   直近5コメント内にステータス変化なし（課題を変えて再確認が必要な場合あり）")
+except Exception as e:
+    print(f"❌ エンドポイント無効またはエラー: {e}")
