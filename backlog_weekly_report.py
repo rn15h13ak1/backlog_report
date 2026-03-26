@@ -714,11 +714,22 @@ def generate_markdown_report(
         "|------|------|",
         f"| 前週からの残件数 | **{len(carry_over)}** 件 |",
         f"| 新規発生件数 | **{len(new_issues)}** 件 |",
+        f"| 再オープン件数 | **{len(reopened)}** 件 |",
         f"| 当週完了件数 | **{len(completed)}** 件 |",
         f"| 当週未完了件数 | **{len(incomplete)}** 件 |",
-        f"| 再オープン件数 | **{len(reopened)}** 件 |",
         "",
     ]
+
+    # 等式チェック: 残件 + 新規 + 再オープン = 完了 + 未完了
+    lhs = len(carry_over) + len(new_issues) + len(reopened)
+    rhs = len(completed) + len(incomplete)
+    if lhs != rhs:
+        lines += [
+            f"> ⚠️ **注意**: 残件（{len(carry_over)}）＋ 新規（{len(new_issues)}）＋ 再オープン（{len(reopened)}）"
+            f"＝ {lhs} に対し、完了（{len(completed)}）＋ 未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
+            "> 同一課題が複数カテゴリに重複して集計されている可能性があります。",
+            "",
+        ]
 
     lines += [
         "---",
@@ -749,6 +760,19 @@ def generate_markdown_report(
         "",
         "---",
         "",
+        "## 再オープン",
+        f"**{len(reopened)} 件** — {ws_str} 〜 {we_str} に完了状態から再度オープンになった課題",
+        "",
+        keys_str(reopened),
+        "",
+        "<details>",
+        "<summary>詳細一覧を表示</summary>",
+        "",
+        format_issue_table(reopened),
+        "</details>",
+        "",
+        "---",
+        "",
         "## 当週完了",
         f"**{len(completed)} 件** — {ws_str} 〜 {we_str} に完了した課題",
         "",
@@ -771,19 +795,6 @@ def generate_markdown_report(
         "<summary>詳細一覧を表示</summary>",
         "",
         format_issue_table(incomplete, max_display=50),
-        "</details>",
-        "",
-        "---",
-        "",
-        "## 再オープン",
-        f"**{len(reopened)} 件** — {ws_str} 〜 {we_str} に完了状態から再度オープンになった課題",
-        "",
-        keys_str(reopened),
-        "",
-        "<details>",
-        "<summary>詳細一覧を表示</summary>",
-        "",
-        format_issue_table(reopened),
         "</details>",
         "",
         "---",
