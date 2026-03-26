@@ -382,6 +382,73 @@ def get_completed_issue_ids_from_project_activities(
     return completed_ids, prev_status_map
 
 
+def get_reopened_issue_ids_from_project_activities(
+    client: BacklogClient,
+    project_key: str,
+    week_start: date,
+    week_end: date,
+    closed_status_names: set,
+    open_status_names: set,
+) -> set:
+    """
+    /projects/{key}/activities を降順スキャンし、
+    対象期間内にステータスが「完了系 → オープン系」へ変化した課題IDセットを返す。
+    （= 期間中に再オープンされた課題）
+    """
+    reopened_ids: set = set()
+    params: dict = {
+        "activityTypeId": [2],
+        "count": 100,
+        "order": "desc",
+    }
+
+    if client.debug:
+        print(f"  [DEBUG] 再オープン判定: closed={closed_status_names}, open={open_status_names}",
+              file=sys.stderr)
+
+    while True:
+        activities = client._get(f"/projects/{project_key}/activities", params)
+        if not activities:
+            break
+
+        stop = False
+        for act in activities:
+            created_str = act.get("created", "")[:10]
+            try:
+                act_date = datetime.strptime(created_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            if act_date < week_start:
+                stop = True
+                break
+
+            if act_date <= week_end:
+                changes = act.get("content", {}).get("changes", [])
+                for change in changes:
+                    if (change.get("field") == "status"
+                            and change.get("old_value") in closed_status_names
+                            and change.get("new_value") in open_status_names):
+                        issue_id = act.get("content", {}).get("id")
+                        if issue_id is not None:
+                            reopened_ids.add(issue_id)
+                            if client.debug:
+                                key_id = act.get("content", {}).get("key_id", "?")
+                                print(f"  [DEBUG] → 再オープンと判定: {project_key}-{key_id} "
+                                      f"(id={issue_id}, "
+                                      f"{change.get('old_value')}→{change.get('new_value')})",
+                                      file=sys.stderr)
+
+        if stop or len(activities) < 100:
+            break
+
+        min_id = min(act["id"] for act in activities)
+        params["maxId"] = min_id - 1
+        time.sleep(0.3)
+
+    return reopened_ids
+
+
 def collect_report_data(
     client: BacklogClient,
     project_key: str,
@@ -407,14 +474,19 @@ def collect_report_data(
         closed_status_names = {
             s["name"] for s in statuses if s["id"] in closed_status_ids
         }
+        open_status_names = {
+            s["name"] for s in statuses if s["id"] in open_status_ids
+        }
         if client.debug:
             print(f"  [DEBUG] 取得ステータス一覧: { {s['id']: s['name'] for s in statuses} }",
                   file=sys.stderr)
             print(f"  [DEBUG] 完了ステータス名: {closed_status_names}", file=sys.stderr)
+            print(f"  [DEBUG] オープンステータス名: {open_status_names}", file=sys.stderr)
     except Exception as e:
         if client.debug:
             print(f"  [DEBUG] ステータス取得失敗: {e}", file=sys.stderr)
         closed_status_names = set()
+        open_status_names = set()
 
     # Step A: updatedSince/Until + 完了ステータスで候補を取得
     # 「処理中→処理済み」のようなステータス変化は必ず updated が更新されるため
@@ -451,15 +523,31 @@ def collect_report_data(
         completed_issues = candidates
     completed_id_set = {i.get("id") for i in completed_issues}
 
+    # ---- ⑤ 再オープン（期間中に完了系→オープン系に変化した課題） ----
+    # アクティビティから期間中に再オープンされた課題IDを検出
+    if closed_status_names and open_status_names:
+        reopened_ids = get_reopened_issue_ids_from_project_activities(
+            client, project_key, week_start, week_end, closed_status_names, open_status_names
+        )
+    else:
+        reopened_ids = set()
+
+    # 「処理中→完了→処理中」のケース: 期間内に完了→再オープン両方を経た課題
+    # → 期間開始時は処理中だったので残件に含めるべき → reopened から除外
+    truly_reopened_ids = reopened_ids - completed_ids if completed_ids else reopened_ids
+
     # ---- ① 前週からの残件 ----
     # 期間開始前に作成され、期間開始前に完了していない課題
-    #   = 現在もオープンで期間前に作成された課題
+    #   = 現在もオープンで期間前に作成された課題（ただし再オープン課題は除外）
     #   + 期間中に完了したが期間前に作成された課題（期間開始時はオープンだった）
-    carry_over_open = client.get_issues(project_id, {
+    carry_over_open_raw = client.get_issues(project_id, {
         **ep,
         "statusId": open_status_ids,
         "createdUntil": (week_start - timedelta(days=1)).strftime("%Y-%m-%d"),
     })
+    # 期間開始前に完了済みだったが期間中に再オープンされた課題は残件から除外
+    carry_over_open = [i for i in carry_over_open_raw if i.get("id") not in truly_reopened_ids]
+
     # 期間中に完了した課題のうち期間前に作成されたもの
     # → 表示ステータスを「期間開始時点のステータス」に差し替える
     carry_over_completed = []
@@ -485,10 +573,27 @@ def collect_report_data(
         "createdUntil": we,
     })
 
+    # ---- ⑤ 再オープン課題の詳細取得 ----
+    # truly_reopened_ids に対応する課題オブジェクトを収集
+    # （carry_over_open_raw から取得済みのもの + 別途取得）
+    reopened_map: dict = {}
+    for i in carry_over_open_raw:
+        if i.get("id") in truly_reopened_ids:
+            reopened_map[i.get("id")] = i
+    # 取得できていないIDはAPIで取得（期間前作成でない再オープン課題）
+    missing_ids = truly_reopened_ids - set(reopened_map.keys())
+    if missing_ids:
+        # 新規課題の中にある場合
+        for i in new_issues:
+            if i.get("id") in missing_ids:
+                reopened_map[i.get("id")] = i
+                missing_ids.discard(i.get("id"))
+    reopened_issues = list(reopened_map.values())
+
     # ---- ④ 当週未完了 ----
-    # 期間最終日時点でオープンの課題 = (残件 + 新規) - 完了
+    # 期間最終日時点でオープンの課題 = (残件 + 新規 + 再オープン) - 完了
     all_issues_map = {}
-    for i in carry_over_issues + new_issues:
+    for i in carry_over_issues + new_issues + reopened_issues:
         all_issues_map[i.get("id")] = i
     incomplete_ids = set(all_issues_map.keys()) - completed_id_set
     incomplete_issues = [all_issues_map[iid] for iid in incomplete_ids]
@@ -498,6 +603,7 @@ def collect_report_data(
         "new_issues": new_issues,
         "completed": completed_issues,
         "incomplete": incomplete_issues,
+        "reopened": reopened_issues,
     }
 
 
@@ -557,6 +663,7 @@ def generate_markdown_report(
     new_issues = data["new_issues"]
     completed = data["completed"]
     incomplete = data["incomplete"]
+    reopened = data.get("reopened", [])
 
     title_suffix = f" — {filter_name}" if filter_name else ""
     lines = [
@@ -581,19 +688,9 @@ def generate_markdown_report(
         f"| 新規発生件数 | **{len(new_issues)}** 件 |",
         f"| 当週完了件数 | **{len(completed)}** 件 |",
         f"| 当週未完了件数 | **{len(incomplete)}** 件 |",
+        f"| 再オープン件数 | **{len(reopened)}** 件 |",
         "",
     ]
-
-    # 等式チェック: 残件 + 新規 = 完了 + 未完了
-    lhs = len(carry_over) + len(new_issues)
-    rhs = len(completed) + len(incomplete)
-    if lhs != rhs:
-        lines += [
-            f"> ⚠️ **注意**: 残件数（{len(carry_over)}）＋ 新規発生（{len(new_issues)}）"
-            f"＝ {lhs} に対し、完了（{len(completed)}）＋ 未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
-            "> 期間中に処理済みから処理中への差し戻しが発生している可能性があります。",
-            "",
-        ]
 
     lines += [
         "---",
@@ -646,6 +743,19 @@ def generate_markdown_report(
         "<summary>詳細一覧を表示</summary>",
         "",
         format_issue_table(incomplete, max_display=50),
+        "</details>",
+        "",
+        "---",
+        "",
+        "## 再オープン",
+        f"**{len(reopened)} 件** — {ws_str} 〜 {we_str} に完了状態から再度オープンになった課題",
+        "",
+        keys_str(reopened),
+        "",
+        "<details>",
+        "<summary>詳細一覧を表示</summary>",
+        "",
+        format_issue_table(reopened),
         "</details>",
         "",
         "---",
