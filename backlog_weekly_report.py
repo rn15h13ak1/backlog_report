@@ -310,17 +310,18 @@ def get_completed_issue_ids_from_project_activities(
     week_start: date,
     week_end: date,
     closed_status_names: set,
-) -> set:
+) -> tuple:
     """
     /projects/{key}/activities（typeId=2: 課題更新）を降順に取得し、
-    対象期間内にステータスが完了系へ変化した課題の数値IDセットを返す。
+    対象期間内にステータスが完了系へ変化した課題の情報を返す。
 
-    Backlog API には課題単位のアクティビティ取得エンドポイントが
-    存在しないオンプレミス版があるため、プロジェクト全体のアクティビティを
-    ID降順（新しい順）にページネーションしながら走査する。
-    対象期間より古いアクティビティが出た時点で走査を打ち切る。
+    Returns:
+        (completed_ids: set, prev_status_map: dict)
+        completed_ids   : 期間内に完了へ変化した課題の数値IDセット
+        prev_status_map : {issue_id: 完了前のステータス名}（期間開始時点のステータス）
     """
     completed_ids: set = set()
+    prev_status_map: dict = {}  # {issue_id: 完了前ステータス名}
     params: dict = {
         "activityTypeId": [2],  # ISSUE_UPDATED のみ
         "count": 100,
@@ -361,8 +362,13 @@ def get_completed_issue_ids_from_project_activities(
                         issue_id = act.get("content", {}).get("id")
                         if issue_id is not None:
                             completed_ids.add(issue_id)
+                            # 完了前のステータス名を記録（最初に見つかったものを優先）
+                            if issue_id not in prev_status_map:
+                                prev_status_map[issue_id] = change.get("old_value", "処理中")
                             if client.debug:
-                                print(f"  [DEBUG] → 完了と判定: {project_key}-{key_id} (id={issue_id})",
+                                print(f"  [DEBUG] → 完了と判定: {project_key}-{key_id} "
+                                      f"(id={issue_id}, "
+                                      f"{change.get('old_value')}→{change.get('new_value')})",
                                       file=sys.stderr)
 
         if stop or len(activities) < 100:
@@ -373,7 +379,7 @@ def get_completed_issue_ids_from_project_activities(
         params["maxId"] = min_id - 1
         time.sleep(0.3)
 
-    return completed_ids
+    return completed_ids, prev_status_map
 
 
 def collect_report_data(
@@ -420,10 +426,11 @@ def collect_report_data(
         "updatedUntil": we,
     })
 
+    prev_status_map: dict = {}  # {issue_id: 期間開始時点のステータス名}
     if closed_status_names and candidates:
         # Step B: プロジェクトアクティビティで「本当に期間内にステータス変化したか」を検証
         # 偽陽性（完了前に更新されたコメント等）を除外するための絞り込み
-        completed_ids = get_completed_issue_ids_from_project_activities(
+        completed_ids, prev_status_map = get_completed_issue_ids_from_project_activities(
             client, project_key, week_start, week_end, closed_status_names
         )
         if completed_ids:
@@ -453,10 +460,15 @@ def collect_report_data(
         "statusId": open_status_ids,
         "createdUntil": (week_start - timedelta(days=1)).strftime("%Y-%m-%d"),
     })
-    carry_over_completed = [
-        i for i in completed_issues
-        if i.get("created", "")[:10] < ws  # 期間開始日より前に作成
-    ]
+    # 期間中に完了した課題のうち期間前に作成されたもの
+    # → 表示ステータスを「期間開始時点のステータス」に差し替える
+    carry_over_completed = []
+    for i in completed_issues:
+        if i.get("created", "")[:10] < ws:
+            issue_copy = {**i}
+            prev_name = prev_status_map.get(i.get("id"), "処理中")
+            issue_copy["status"] = {**issue_copy.get("status", {}), "name": prev_name}
+            carry_over_completed.append(issue_copy)
     # 重複排除してマージ
     seen_ids = set()
     carry_over_issues = []
