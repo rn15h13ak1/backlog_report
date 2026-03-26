@@ -45,8 +45,26 @@ print(f"接続先: {base_url}")
 print(f"プロジェクト: {project_key}")
 print()
 
+# Step0: 接続・認証確認（/space は最もシンプルなエンドポイント）
+print("=== Step0: 接続・認証確認 ===")
+try:
+    space = get("/space")
+    print(f"✅ 接続OK: {space.get('name', space)}")
+except Exception as e:
+    print(f"❌ 接続失敗: {e}")
+    print("  → space_host / base_path / api_key / ssl_verify を確認してください")
+    sys.exit(1)
+print()
+
 # Step1: プロジェクト情報を取得して project_id と issue を1件取得
 print("=== Step1: 課題を1件取得 ===")
+try:
+    project = get(f"/projects/{project_key}")
+    print(f"✅ プロジェクト取得OK: {project.get('name')} (id={project.get('id')})")
+except Exception as e:
+    print(f"❌ プロジェクト取得失敗: {e}")
+    print("  → project_key を確認してください")
+    sys.exit(1)
 issues = get(f"/projects/{project_key}/issues", {"count": 1})
 if not issues:
     print("課題が1件も見つかりませんでした。")
