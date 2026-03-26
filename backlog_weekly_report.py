@@ -320,13 +320,16 @@ def scan_issue_status_changes_from_activities(
     week_end: date,
     closed_status_names: set,
     open_status_names: set,
+    closed_status_ids: list,
+    open_status_ids: list,
+    status_id_to_name: dict,
 ) -> tuple:
     """
     /projects/{key}/activities を1回だけ降順スキャンし、
     対象期間内のステータス変化（完了・再オープン両方）を同時に検出する。
 
-    activityTypeId に [2, 3] を指定することで、Backlogのバージョンによって
-    「課題更新」のtype IDが2か3か異なる場合でも確実に捕捉する。
+    Backlog on-premise では old_value/new_value がステータス名ではなく
+    数値ID（文字列）で記録されることがあるため、名前・ID両方で照合する。
 
     Returns:
         (completed_ids, prev_status_map, reopened_ids)
@@ -338,6 +341,22 @@ def scan_issue_status_changes_from_activities(
     prev_status_map: dict = {}
     reopened_ids: set = set()
 
+    # ステータスIDを文字列に変換して照合用セットを作成（APIがIDを文字列で返す場合に対応）
+    closed_id_strs: set = {str(sid) for sid in closed_status_ids}
+    open_id_strs: set = {str(sid) for sid in open_status_ids}
+
+    def is_closed(val: str) -> bool:
+        return val in closed_status_names or val in closed_id_strs
+
+    def is_open(val: str) -> bool:
+        return val in open_status_names or val in open_id_strs
+
+    def resolve_name(val: str) -> str:
+        """IDまたは名前をステータス名に解決する"""
+        if val in status_id_to_name:
+            return status_id_to_name[val]
+        return val or "処理中"
+
     params: dict = {
         "activityTypeId": [2, 3],  # type2=課題更新(cloud), type3=課題更新(on-premise) 両対応
         "count": 100,
@@ -347,8 +366,10 @@ def scan_issue_status_changes_from_activities(
     if client.debug:
         print(f"  [DEBUG] アクティビティスキャン開始: project={project_key}, "
               f"period={week_start}〜{week_end}", file=sys.stderr)
-        print(f"  [DEBUG] 完了ステータス名: {closed_status_names}", file=sys.stderr)
-        print(f"  [DEBUG] オープンステータス名: {open_status_names}", file=sys.stderr)
+        print(f"  [DEBUG] 完了ステータス名={closed_status_names} ID={closed_id_strs}",
+              file=sys.stderr)
+        print(f"  [DEBUG] オープンステータス名={open_status_names} ID={open_id_strs}",
+              file=sys.stderr)
 
     while True:
         activities = client._get(f"/projects/{project_key}/activities", params)
@@ -382,20 +403,20 @@ def scan_issue_status_changes_from_activities(
                 for change in changes:
                     if change.get("field") != "status" or issue_id is None:
                         continue
-                    old_val = change.get("old_value", "")
-                    new_val = change.get("new_value", "")
+                    old_val = str(change.get("old_value", ""))
+                    new_val = str(change.get("new_value", ""))
 
-                    # 完了への変化
-                    if new_val in closed_status_names:
+                    # 完了への変化（名前またはIDで判定）
+                    if is_closed(new_val):
                         completed_ids.add(issue_id)
                         if issue_id not in prev_status_map:
-                            prev_status_map[issue_id] = old_val or "処理中"
+                            prev_status_map[issue_id] = resolve_name(old_val)
                         if client.debug:
                             print(f"  [DEBUG] → 完了と判定: {project_key}-{key_id} "
                                   f"(id={issue_id}, {old_val}→{new_val})", file=sys.stderr)
 
-                    # 再オープンへの変化（完了系→オープン系）
-                    if old_val in closed_status_names and new_val in open_status_names:
+                    # 再オープンへの変化（完了系→オープン系、名前またはIDで判定）
+                    if is_closed(old_val) and is_open(new_val):
                         reopened_ids.add(issue_id)
                         if client.debug:
                             print(f"  [DEBUG] → 再オープンと判定: {project_key}-{key_id} "
@@ -443,6 +464,8 @@ def collect_report_data(
         open_status_names = {
             s["name"] for s in statuses if s["id"] in open_status_ids
         }
+        # IDを文字列キーにしたステータス名マップ（アクティビティのID→名前解決用）
+        status_id_to_name = {str(s["id"]): s["name"] for s in statuses}
         if client.debug:
             print(f"  [DEBUG] 取得ステータス一覧: { {s['id']: s['name'] for s in statuses} }",
                   file=sys.stderr)
@@ -453,6 +476,7 @@ def collect_report_data(
             print(f"  [DEBUG] ステータス取得失敗: {e}", file=sys.stderr)
         closed_status_names = set()
         open_status_names = set()
+        status_id_to_name = {}
 
     # Step A: updatedSince/Until + 完了ステータスで候補を取得
     # 「処理中→処理済み」のようなステータス変化は必ず updated が更新されるため
@@ -469,14 +493,13 @@ def collect_report_data(
     reopened_ids: set = set()
 
     # Step B: アクティビティを1回だけ走査し、完了・再オープン両方を同時に検出
-    if closed_status_names and open_status_names:
+    # old_value/new_value がステータス名またはID（文字列）のどちらでも照合できるよう両方渡す
+    if closed_status_names or closed_status_ids:
         completed_ids, prev_status_map, reopened_ids = scan_issue_status_changes_from_activities(
-            client, project_key, week_start, week_end, closed_status_names, open_status_names
-        )
-    elif closed_status_names:
-        # open_status_names が空の場合（設定異常）でも完了だけは検出
-        completed_ids, prev_status_map, _ = scan_issue_status_changes_from_activities(
-            client, project_key, week_start, week_end, closed_status_names, set()
+            client, project_key, week_start, week_end,
+            closed_status_names, open_status_names,
+            closed_status_ids, open_status_ids,
+            status_id_to_name,
         )
 
     if completed_ids:
