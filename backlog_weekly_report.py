@@ -1093,9 +1093,9 @@ def _print_summary(output_path: Path, data: dict) -> None:
     print(f"  ✅ 保存: {output_path}")
     print(f"     前週残件: {len(data['carry_over'])} 件 / "
           f"新規: {len(data['new_issues'])} 件 / "
+          f"再オープン: {len(data['reopened'])} 件 / "
           f"完了: {len(data['completed'])} 件 / "
-          f"未完了: {len(data['incomplete'])} 件 / "
-          f"再オープン: {len(data['reopened'])} 件")
+          f"未完了: {len(data['incomplete'])} 件")
 
 
 if __name__ == "__main__":
