@@ -970,7 +970,7 @@ def main():
     print("Backlog レポート生成")
     print("=" * 55)
     print(f"スペース    : {space_host}")
-    print(f"プロジェクト : {project_key}")
+    print(f"プロジェクト : {project_key}（デフォルト）")
     print(f"対象期間    : {week_start} 〜 {week_end}（{period_label}）")
     print(f"フィルター数 : {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
     print()
@@ -979,71 +979,83 @@ def main():
     base_path  = backlog_cfg.get("base_path", "")
     client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify, base_path=base_path, debug=args.debug)
 
-    # プロジェクト情報取得
-    print("プロジェクト情報を取得中...")
-    try:
-        project = client.get_project(project_key)
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"エラー: プロジェクト情報の取得に失敗しました: {e}", file=sys.stderr)
-        sys.exit(1)
+    # ---- プロジェクト情報キャッシュ ----
+    # 同一 project_key に対する API 呼び出しを1回に抑える。
+    # 構造: {project_key: {id, name, issue_type_map, custom_field_map, master_loaded}}
+    project_cache: dict = {}
 
-    project_id = project["id"]
-    project_name = project["name"]
-    print(f"プロジェクト名: {project_name} (ID: {project_id})")
-
-    # 種別・カスタム属性マスターを取得（フィルターがある場合のみ）
-    issue_type_map = {}    # {名前: ID}
-    custom_field_map = {}  # {名前: {id, typeId}}
-
-    if filters_cfg:
-        print("種別・カスタム属性マスターを取得中...")
-        try:
-            issue_types = client.get_issue_types(project_key)
-            issue_type_map = {it["name"]: it["id"] for it in issue_types}
-            if args.debug:
-                print(f"  [DEBUG] 種別マップ（名前→ID）: {issue_type_map}", file=sys.stderr)
-            else:
-                print(f"  種別: {list(issue_type_map.keys())}")
-        except Exception as e:
-            print(f"  ⚠ 種別マスターの取得に失敗: {e}", file=sys.stderr)
-
-        try:
-            custom_fields = client.get_custom_fields(project_key)
-            custom_field_map = {
-                cf["name"]: {
-                    "id": cf["id"],
-                    "typeId": cf.get("typeId"),
-                    # リスト型（typeId 5/6/7/8）の選択肢を {名前: ID} で保持
-                    "items": {
-                        item["name"]: item["id"]
-                        for item in cf.get("items", [])
-                    },
-                }
-                for cf in custom_fields
+    def get_project_info(pk: str, need_master: bool = False) -> dict:
+        """プロジェクト情報をキャッシュ付きで取得する。"""
+        if pk not in project_cache:
+            print(f"プロジェクト情報を取得中... ({pk})")
+            try:
+                proj = client.get_project(pk)
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"エラー: プロジェクト情報の取得に失敗しました ({pk}): {e}", file=sys.stderr)
+                sys.exit(1)
+            project_cache[pk] = {
+                "id":               proj["id"],
+                "name":             proj["name"],
+                "issue_type_map":   {},
+                "custom_field_map": {},
+                "master_loaded":    False,
             }
-            if args.debug:
-                # items も含めた詳細マップを表示
-                for fname, finfo in custom_field_map.items():
-                    print(f"  [DEBUG] カスタム属性「{fname}」: id={finfo['id']}, typeId={finfo['typeId']}, items={finfo['items']}", file=sys.stderr)
-            else:
-                print(f"  カスタム属性: {list(custom_field_map.keys())}")
-        except Exception as e:
-            print(f"  ⚠ カスタム属性マスターの取得に失敗: {e}", file=sys.stderr)
+            print(f"プロジェクト名: {project_cache[pk]['name']} (ID: {project_cache[pk]['id']})")
 
+        info = project_cache[pk]
+
+        if need_master and not info["master_loaded"]:
+            print(f"種別・カスタム属性マスターを取得中... ({pk})")
+            try:
+                issue_types = client.get_issue_types(pk)
+                info["issue_type_map"] = {it["name"]: it["id"] for it in issue_types}
+                if args.debug:
+                    print(f"  [DEBUG] 種別マップ（名前→ID）: {info['issue_type_map']}", file=sys.stderr)
+                else:
+                    print(f"  種別: {list(info['issue_type_map'].keys())}")
+            except Exception as e:
+                print(f"  ⚠ 種別マスターの取得に失敗: {e}", file=sys.stderr)
+
+            try:
+                custom_fields = client.get_custom_fields(pk)
+                info["custom_field_map"] = {
+                    cf["name"]: {
+                        "id":     cf["id"],
+                        "typeId": cf.get("typeId"),
+                        # リスト型（typeId 5/6/7/8）の選択肢を {名前: ID} で保持
+                        "items":  {item["name"]: item["id"] for item in cf.get("items", [])},
+                    }
+                    for cf in custom_fields
+                }
+                if args.debug:
+                    for fname, finfo in info["custom_field_map"].items():
+                        print(f"  [DEBUG] カスタム属性「{fname}」: id={finfo['id']}, typeId={finfo['typeId']}, items={finfo['items']}", file=sys.stderr)
+                else:
+                    print(f"  カスタム属性: {list(info['custom_field_map'].keys())}")
+            except Exception as e:
+                print(f"  ⚠ カスタム属性マスターの取得に失敗: {e}", file=sys.stderr)
+
+            info["master_loaded"] = True
+
+        return info
+
+    # デフォルトプロジェクトを先に取得（存在確認 + ヘッダー表示）
+    get_project_info(project_key, need_master=False)
     print()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- フィルターなし（filters が空の場合）----
     if not filters_cfg:
+        default_info = get_project_info(project_key)
         print("【フィルターなし】全課題を集計中...")
         data = collect_report_data(
-            client, project_key, project_id, week_start, week_end,
+            client, project_key, default_info["id"], week_start, week_end,
             open_status_ids, closed_status_ids
         )
         report_md = generate_markdown_report(
-            data, project_key, project_name, week_start, week_end
+            data, project_key, default_info["name"], week_start, week_end
         )
         filename = f"weekly_report_{week_start.strftime('%Y%m%d')}_{week_end.strftime('%Y%m%d')}.md"
         output_path = output_dir / filename
@@ -1055,24 +1067,37 @@ def main():
     for i, filter_cfg in enumerate(filters_cfg, 1):
         filter_name = filter_cfg.get("name") or f"filter_{i}"
         filter_desc = filter_cfg.get("description") or ""
+
+        # フィルター個別の project_key（未指定ならデフォルトを使用）
+        filter_project_key = filter_cfg.get("project_key") or project_key
+
+        # プロジェクト情報をキャッシュ付きで取得（初回のみ API 呼び出し）
+        proj_info = get_project_info(filter_project_key, need_master=True)
+        filter_project_id   = proj_info["id"]
+        filter_project_name = proj_info["name"]
+        filter_issue_type_map   = proj_info["issue_type_map"]
+        filter_custom_field_map = proj_info["custom_field_map"]
+
         filter_summary = build_filter_summary(filter_cfg)
 
         print(f"[{i}/{len(filters_cfg)}] フィルター「{filter_name}」を集計中...")
+        if filter_project_key != project_key:
+            print(f"         プロジェクト: {filter_project_key}")
         print(f"         条件: {filter_summary}")
 
         # フィルターパラメータを解決
-        extra_params = resolve_filter_params(filter_cfg, issue_type_map, custom_field_map)
+        extra_params = resolve_filter_params(filter_cfg, filter_issue_type_map, filter_custom_field_map)
         if args.debug:
             print(f"  [DEBUG] 解決済みフィルターパラメータ: {extra_params}", file=sys.stderr)
 
         data = collect_report_data(
-            client, project_key, project_id, week_start, week_end,
+            client, filter_project_key, filter_project_id, week_start, week_end,
             open_status_ids, closed_status_ids,
             extra_params=extra_params,
         )
 
         report_md = generate_markdown_report(
-            data, project_key, project_name, week_start, week_end,
+            data, filter_project_key, filter_project_name, week_start, week_end,
             filter_name=filter_name,
             filter_description=filter_desc,
             filter_summary=filter_summary,
