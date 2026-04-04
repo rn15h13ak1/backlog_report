@@ -409,7 +409,12 @@ def classify_issue_from_comments(
     was_closed_at_start = is_pre_period and (status_at_start in closed_status_names)
 
     # 期間中の変化
-    completed_during = any(c["to"] in closed_status_names for c in changes_in)
+    # completed_during: オープン系 → 完了系 の変化のみ対象
+    # （完了系 → 完了系 の変化、例: 処理済み → 完了 は除外）
+    completed_during = any(
+        c["from"] in open_status_names and c["to"] in closed_status_names
+        for c in changes_in
+    )
     reopened_during  = any(
         c["from"] in closed_status_names and c["to"] in open_status_names
         for c in changes_in
