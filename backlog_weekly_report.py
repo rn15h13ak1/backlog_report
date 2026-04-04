@@ -401,6 +401,14 @@ def classify_issue_from_comments(
     else:
         status_at_start = issue.get("status", {}).get("name", "")
 
+    # 期間終了時点のステータスを確定
+    # ・期間中に変化あり → 最後の変化の to が期間終了時ステータス
+    # ・変化なし         → 期間開始時と同じ
+    if changes_in:
+        status_at_end = changes_in[-1]["to"]
+    else:
+        status_at_end = status_at_start
+
     is_pre_period = created < ws
     is_new        = ws <= created <= we
 
@@ -426,6 +434,7 @@ def classify_issue_from_comments(
         "is_completed":    completed_during,                          # ③
         "is_reopened":     was_closed_at_start and reopened_during,  # ⑤
         "status_at_start": status_at_start,
+        "status_at_end":   status_at_end,
     }
 
 
@@ -643,17 +652,21 @@ def collect_report_data(
             else:
                 carry_over_issues.append(issue)
 
-        # ② 新規発生
+        # ② 新規発生: 表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
         if result["is_new"]:
-            new_issues.append(issue)
+            issue_copy = {**issue}
+            issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
+            new_issues.append(issue_copy)
 
         # ③ 当週完了
         if result["is_completed"]:
             completed_issues.append(issue)
 
-        # ⑤ 再オープン
+        # ⑤ 再オープン: 表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
         if result["is_reopened"]:
-            reopened_issues.append(issue)
+            issue_copy = {**issue}
+            issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
+            reopened_issues.append(issue_copy)
 
     # ---- ④ 当週未完了 = (① + ② + ⑤) - ③ ----
     completed_id_set = {i.get("id") for i in completed_issues}
