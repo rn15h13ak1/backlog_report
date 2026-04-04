@@ -275,6 +275,11 @@ def resolve_filter_params(
     """
     extra = {}
 
+    # ---- 件名キーワードフィルター ----
+    keyword = filter_cfg.get("keyword")
+    if keyword:
+        extra["keyword"] = keyword
+
     # ---- 種別フィルター ----
     issue_types = filter_cfg.get("issue_types") or []
     if issue_types:
@@ -833,6 +838,9 @@ def generate_markdown_report(
 def build_filter_summary(filter_cfg: dict) -> str:
     """フィルター条件の人間向け要約文字列を生成"""
     parts = []
+    keyword = filter_cfg.get("keyword")
+    if keyword:
+        parts.append(f"件名キーワード: {keyword}")
     issue_types = filter_cfg.get("issue_types") or []
     if issue_types:
         parts.append(f"種別: {', '.join(issue_types)}")

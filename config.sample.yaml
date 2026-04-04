@@ -81,6 +81,7 @@ filters:
   - name: "バグ対応"                   # レポートファイル名・見出しに使われます
     description: "バグ種別の課題集計"   # 任意のメモ（レポートに記載されます）
     # project_key: "OTHER_PROJECT"     # 省略時は backlog.project_key を使用
+    # keyword: "【障害】"              # 件名・詳細の部分一致キーワード（任意）
     issue_types:                        # Backlogの「種別」名を指定（複数指定でOR条件）
       - "バグ"
     # custom_fields は省略 → カスタム属性フィルターなし
