@@ -1057,6 +1057,10 @@ def main():
     # デフォルトプロジェクトを先に取得（存在確認 + ヘッダー表示）
     get_project_info(project_key, need_master=False)
     print()
+
+    # 期間フォルダを output_dir 配下に作成（例: reports/20260101_20260107/）
+    period_dir = f"{week_start.strftime('%Y%m%d')}_{week_end.strftime('%Y%m%d')}"
+    output_dir = output_dir / period_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- フィルターなし（filters が空の場合）----
@@ -1070,8 +1074,7 @@ def main():
         report_md = generate_markdown_report(
             data, project_key, default_info["name"], week_start, week_end
         )
-        filename = f"weekly_report_{week_start.strftime('%Y%m%d')}_{week_end.strftime('%Y%m%d')}.md"
-        output_path = output_dir / filename
+        output_path = output_dir / "weekly_report.md"
         output_path.write_text(report_md, encoding="utf-8")
         _print_summary(output_path, data)
         return
@@ -1117,11 +1120,7 @@ def main():
         )
 
         safe_name = safe_filename(filter_name)
-        filename = (
-            f"weekly_report_{week_start.strftime('%Y%m%d')}_"
-            f"{week_end.strftime('%Y%m%d')}_{safe_name}.md"
-        )
-        output_path = output_dir / filename
+        output_path = output_dir / f"weekly_report_{safe_name}.md"
         output_path.write_text(report_md, encoding="utf-8")
         _print_summary(output_path, data)
         print()
