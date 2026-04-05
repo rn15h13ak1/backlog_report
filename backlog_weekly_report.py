@@ -7,11 +7,12 @@ config.yaml の filters に複数のフィルターを定義すると、
 フィルターごとに個別のレポートファイルが生成されます。
 
 集計内容:
-  - 期間開始前からの残件数（期間開始より前に作成され現在も未完了の課題数）
-  - 新規発生件数（対象期間に作成された課題数）
-  - 期間内完了件数（対象期間に完了した課題数）
-  - 未完了件数（現在オープンの課題数）
-  - 各カテゴリのBacklog課題番号一覧
+  ① 前週残件数   : 期間開始より前に作成され、期間開始時点でオープンだった課題
+  ② 新規発生件数 : 対象期間に新しく作成された課題
+  ③ 再オープン件数: 期間開始時点で完了系だったが、期間中にオープン系へ変化した課題
+  ④ 当週完了件数 : 期間中にオープン系から完了系へ変化した課題
+  ⑤ 当週未完了件数: ① + ② + ③ のうち④で完了しなかった課題（等式: ① + ② + ③ = ④ + ⑤）
+  各カテゴリのBacklog課題番号一覧も出力
 
 使い方:
   # 前週を自動計算して集計（デフォルト）
@@ -363,9 +364,10 @@ def classify_issue_from_comments(
     Returns:
         is_carry_over   : ① 期間前作成かつ期間開始時オープン
         is_new          : ② 期間中作成
-        is_completed    : ③ 期間中に完了系ステータスへ変化
-        is_reopened     : ⑤ 期間開始時は完了系かつ期間中にオープン系へ変化
+        is_reopened     : ③ 期間開始時は完了系かつ期間中にオープン系へ変化
+        is_completed    : ④ 期間中にオープン系から完了系へ変化
         status_at_start : 期間開始時点のステータス名
+        status_at_end   : 期間終了時点のステータス名
     """
     ws = week_start.strftime("%Y-%m-%d")
     we = week_end.strftime("%Y-%m-%d")
@@ -431,8 +433,8 @@ def classify_issue_from_comments(
     return {
         "is_carry_over":   was_open_at_start,                        # ①
         "is_new":          is_new,                                    # ②
-        "is_completed":    completed_during,                          # ③
-        "is_reopened":     was_closed_at_start and reopened_during,  # ⑤
+        "is_reopened":     was_closed_at_start and reopened_during,  # ③
+        "is_completed":    completed_during,                          # ④
         "status_at_start": status_at_start,
         "status_at_end":   status_at_end,
     }
@@ -582,7 +584,7 @@ def collect_report_data(
       1. 最新属性でフィルターした全対象課題を取得（statusId 不問）
       2. 各課題のコメントを取得してステータス変化履歴を構築
       3. classify_issue_from_comments で①〜⑤を独立判定
-      4. ④当週未完了 = (①+②+⑤) - ③ で計算
+      4. ⑤当週未完了 = (①+②+③) - ④ で計算
     """
     ws = week_start.strftime("%Y-%m-%d")
     we = week_end.strftime("%Y-%m-%d")
@@ -658,17 +660,17 @@ def collect_report_data(
             issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
             new_issues.append(issue_copy)
 
-        # ③ 当週完了
-        if result["is_completed"]:
-            completed_issues.append(issue)
-
-        # ⑤ 再オープン: 表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
+        # ③ 再オープン: 表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
         if result["is_reopened"]:
             issue_copy = {**issue}
             issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
             reopened_issues.append(issue_copy)
 
-    # ---- ④ 当週未完了 = (① + ② + ⑤) - ③ ----
+        # ④ 当週完了
+        if result["is_completed"]:
+            completed_issues.append(issue)
+
+    # ---- ⑤ 当週未完了 = (① + ② + ③) - ④ ----
     completed_id_set = {i.get("id") for i in completed_issues}
     active_ids       = {i.get("id") for i in carry_over_issues + new_issues + reopened_issues}
     incomplete_ids   = active_ids - completed_id_set
@@ -760,21 +762,21 @@ def generate_markdown_report(
         "",
         "| 項目 | 件数 |",
         "|------|------|",
-        f"| 前週からの残件数 | **{len(carry_over)}** 件 |",
-        f"| 新規発生件数 | **{len(new_issues)}** 件 |",
-        f"| 再オープン件数 | **{len(reopened)}** 件 |",
-        f"| 当週完了件数 | **{len(completed)}** 件 |",
-        f"| 当週未完了件数 | **{len(incomplete)}** 件 |",
+        f"| ① 前週残件数 | **{len(carry_over)}** 件 |",
+        f"| ② 新規発生件数 | **{len(new_issues)}** 件 |",
+        f"| ③ 再オープン件数 | **{len(reopened)}** 件 |",
+        f"| ④ 当週完了件数 | **{len(completed)}** 件 |",
+        f"| ⑤ 当週未完了件数 | **{len(incomplete)}** 件 |",
         "",
     ]
 
-    # 等式チェック: 残件 + 新規 + 再オープン = 完了 + 未完了
+    # 等式チェック: ① + ② + ③ = ④ + ⑤
     lhs = len(carry_over) + len(new_issues) + len(reopened)
     rhs = len(completed) + len(incomplete)
     if lhs != rhs:
         lines += [
-            f"> ⚠️ **注意**: 残件（{len(carry_over)}）＋ 新規（{len(new_issues)}）＋ 再オープン（{len(reopened)}）"
-            f"＝ {lhs} に対し、完了（{len(completed)}）＋ 未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
+            f"> ⚠️ **注意**: ①残件（{len(carry_over)}）＋ ②新規（{len(new_issues)}）＋ ③再オープン（{len(reopened)}）"
+            f"＝ {lhs} に対し、④完了（{len(completed)}）＋ ⑤未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
             "> 同一課題が複数カテゴリに重複して集計されている可能性があります。",
             "",
         ]
@@ -782,7 +784,7 @@ def generate_markdown_report(
     lines += [
         "---",
         "",
-        "## 前週からの残件",
+        "## ① 前週残件",
         f"**{len(carry_over)} 件** — {week_start.strftime('%Y/%m/%d')} より前に作成され、{week_start.strftime('%Y/%m/%d')} 時点で未完了の課題",
         "",
         keys_str(carry_over),
@@ -795,7 +797,7 @@ def generate_markdown_report(
         "",
         "---",
         "",
-        "## 新規発生",
+        "## ② 新規発生",
         f"**{len(new_issues)} 件** — {ws_str} 〜 {we_str} に作成された課題",
         "",
         keys_str(new_issues),
@@ -808,7 +810,7 @@ def generate_markdown_report(
         "",
         "---",
         "",
-        "## 再オープン",
+        "## ③ 再オープン",
         f"**{len(reopened)} 件** — {ws_str} 〜 {we_str} に完了状態から再度オープンになった課題",
         "",
         keys_str(reopened),
@@ -821,7 +823,7 @@ def generate_markdown_report(
         "",
         "---",
         "",
-        "## 当週完了",
+        "## ④ 当週完了",
         f"**{len(completed)} 件** — {ws_str} 〜 {we_str} に完了した課題",
         "",
         keys_str(completed),
@@ -834,7 +836,7 @@ def generate_markdown_report(
         "",
         "---",
         "",
-        "## 当週未完了一覧",
+        "## ⑤ 当週未完了",
         f"**{len(incomplete)} 件** — {we_str} 時点でオープン（未対応・処理中）の課題",
         "",
         keys_str(incomplete),
@@ -1141,11 +1143,11 @@ def main():
 
 def _print_summary(output_path: Path, data: dict) -> None:
     print(f"  ✅ 保存: {output_path}")
-    print(f"     前週残件: {len(data['carry_over'])} 件 / "
-          f"新規: {len(data['new_issues'])} 件 / "
-          f"再オープン: {len(data['reopened'])} 件 / "
-          f"完了: {len(data['completed'])} 件 / "
-          f"未完了: {len(data['incomplete'])} 件")
+    print(f"     ①前週残件: {len(data['carry_over'])} 件 / "
+          f"②新規: {len(data['new_issues'])} 件 / "
+          f"③再オープン: {len(data['reopened'])} 件 / "
+          f"④完了: {len(data['completed'])} 件 / "
+          f"⑤未完了: {len(data['incomplete'])} 件")
 
 
 if __name__ == "__main__":
