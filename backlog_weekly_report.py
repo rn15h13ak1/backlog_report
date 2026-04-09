@@ -1095,6 +1095,7 @@ def main():
         return
 
     # ---- フィルターごとに集計・出力 ----
+    all_filter_data = []
     for i, filter_cfg in enumerate(filters_cfg, 1):
         filter_name = filter_cfg.get("name") or f"filter_{i}"
         filter_desc = filter_cfg.get("description") or ""
@@ -1134,11 +1135,84 @@ def main():
             filter_summary=filter_summary,
         )
 
+        all_filter_data.append((filter_name, data))
+
         safe_name = safe_filename(filter_name)
         output_path = output_dir / f"weekly_report_{safe_name}.md"
         output_path.write_text(report_md, encoding="utf-8")
         _print_summary(output_path, data)
         print()
+
+    # ---- サマリーレポート出力 ----
+    if all_filter_data:
+        summary_md = generate_summary_report(all_filter_data, week_start, week_end)
+        summary_path = output_dir / "summary_report.md"
+        summary_path.write_text(summary_md, encoding="utf-8")
+        print(f"  ✅ サマリー保存: {summary_path}")
+
+
+def _fmt_due(due_raw: str | None) -> str:
+    """期限日を m/d 形式に変換（例: '2026-04-07T...' → '4/7'）"""
+    if not due_raw:
+        return "なし"
+    d = due_raw[:10]  # "YYYY-MM-DD"
+    m, day = int(d[5:7]), int(d[8:10])
+    return f"{m}/{day}"
+
+
+def generate_summary_report(
+    all_filter_data: list,
+    week_start,
+    week_end,
+) -> str:
+    """全フィルターをまとめたサマリーレポートを生成"""
+    lines = [
+        f"# サマリーレポート — {week_start.strftime('%Y/%m/%d')} 〜 {week_end.strftime('%Y/%m/%d')}",
+        "",
+    ]
+
+    for idx, (filter_name, data) in enumerate(all_filter_data):
+        carry_over = data["carry_over"]
+        new_issues = data["new_issues"]
+        reopened   = data["reopened"]
+        completed  = data["completed"]
+        incomplete = data["incomplete"]
+
+        lines.append(filter_name)
+        lines.append(
+            f"残:{len(carry_over)} / 新規:{len(new_issues)} / "
+            f"再オープン:{len(reopened)} / 完了:{len(completed)} / 未完了:{len(incomplete)}"
+        )
+
+        def _issue_sort_key(issue):
+            key = issue.get("issueKey", "")
+            try:
+                return int(key.rsplit("-", 1)[-1])
+            except ValueError:
+                return 0
+
+        for issue in sorted(completed, key=_issue_sort_key):
+            key    = issue.get("issueKey", "-")
+            status = issue.get("status", {}).get("name", "-")
+            due    = _fmt_due(issue.get("dueDate"))
+            summary = issue.get("summary", "-")
+            lines.append(f"●{key}｜期限：{due}｜{status}")
+            lines.append(summary)
+
+        for issue in sorted(incomplete, key=_issue_sort_key):
+            key    = issue.get("issueKey", "-")
+            status = issue.get("status", {}).get("name", "-")
+            due    = _fmt_due(issue.get("dueDate"))
+            summary = issue.get("summary", "-")
+            lines.append(f"●{key}｜期限：{due}｜{status}")
+            lines.append(summary)
+
+        if idx < len(all_filter_data) - 1:
+            lines.append("")
+            lines.append("----")
+            lines.append("")
+
+    return "\n".join(lines) + "\n"
 
 
 def _print_summary(output_path: Path, data: dict) -> None:
