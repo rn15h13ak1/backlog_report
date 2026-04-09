@@ -1197,15 +1197,7 @@ def generate_summary_report(
             f"再オープン:{len(reopened)} / 完了:{len(completed)} / 未完了:{len(incomplete)}"
         )
 
-        for issue in sorted(completed, key=_issue_sort_key):
-            key    = issue.get("issueKey", "-")
-            status = issue.get("status", {}).get("name", "-")
-            due    = _fmt_due(issue.get("dueDate"))
-            summary = issue.get("summary", "-")
-            lines.append(f"●{key}｜期限：{due}｜{status}")
-            lines.append(summary)
-
-        for issue in sorted(incomplete, key=_issue_sort_key):
+        for issue in sorted(completed + incomplete, key=_issue_sort_key):
             key    = issue.get("issueKey", "-")
             status = issue.get("status", {}).get("name", "-")
             due    = _fmt_due(issue.get("dueDate"))
