@@ -620,6 +620,7 @@ def collect_report_data(
     new_issues:        list = []
     completed_issues:  list = []
     reopened_issues:   list = []
+    status_at_end_map: dict = {}  # issue_id -> 期間終了時点のステータス名
 
     for issue in all_issues:
         issue_id_val = issue.get("id")
@@ -666,15 +667,27 @@ def collect_report_data(
             issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
             reopened_issues.append(issue_copy)
 
-        # ④ 当週完了
+        # 期間終了時点のステータスを記録（④⑤の表示用）
+        status_at_end_map[issue_id_val] = result["status_at_end"]
+
+        # ④ 当週完了: 表示ステータスを期間終了時点に差し替え
         if result["is_completed"]:
-            completed_issues.append(issue)
+            issue_copy = {**issue}
+            issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
+            completed_issues.append(issue_copy)
 
     # ---- ⑤ 当週未完了 = (① + ② + ③) - ④ ----
     completed_id_set = {i.get("id") for i in completed_issues}
     active_ids       = {i.get("id") for i in carry_over_issues + new_issues + reopened_issues}
     incomplete_ids   = active_ids - completed_id_set
-    incomplete_issues = [all_issues_map[iid] for iid in incomplete_ids if iid in all_issues_map]
+    incomplete_issues = []
+    for iid in incomplete_ids:
+        if iid not in all_issues_map:
+            continue
+        issue_copy = {**all_issues_map[iid]}
+        if iid in status_at_end_map:
+            issue_copy["status"] = {**issue_copy.get("status", {}), "name": status_at_end_map[iid]}
+        incomplete_issues.append(issue_copy)
 
     return {
         "carry_over": carry_over_issues,
