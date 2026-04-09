@@ -376,6 +376,7 @@ def classify_issue_from_comments(
     # コメントの changeLog からステータス変化を抽出（コメントは昇順で渡される前提）
     changes_before: list = []  # 期間前のステータス変化
     changes_in: list = []      # 期間中のステータス変化
+    changes_after: list = []   # 期間後のステータス変化
 
     for comment in comments:
         comment_date = comment.get("created", "")[:10]
@@ -391,23 +392,31 @@ def classify_issue_from_comments(
                 changes_before.append(entry)
             elif comment_date <= we:
                 changes_in.append(entry)
+            else:
+                changes_after.append(entry)
 
     # 期間開始時点のステータスを確定
-    # ・期間前に変化あり  → 最後の変化の to が期間開始時ステータス
-    # ・期間中に初めて変化 → 最初の変化の from が期間開始時ステータス（変化前）
-    # ・変化なし         → 現在のステータス（期間中も同じだったため）
+    # ・期間前に変化あり        → 最後の変化の to が期間開始時ステータス
+    # ・期間中に初めて変化      → 最初の変化の from が期間開始時ステータス（変化前）
+    # ・期間後にのみ変化あり    → 最初の期間後変化の from が期間開始時ステータス
+    # ・変化なし（全期間同一）  → 現在のステータス
     if changes_before:
         status_at_start = changes_before[-1]["to"]
     elif changes_in:
         status_at_start = changes_in[0]["from"]
+    elif changes_after:
+        status_at_start = changes_after[0]["from"]
     else:
         status_at_start = issue.get("status", {}).get("name", "")
 
     # 期間終了時点のステータスを確定
-    # ・期間中に変化あり → 最後の変化の to が期間終了時ステータス
-    # ・変化なし         → 期間開始時と同じ
+    # ・期間中に変化あり     → 最後の変化の to が期間終了時ステータス
+    # ・期間後にのみ変化あり → 最初の期間後変化の from（期間中は変化していないため）
+    # ・変化なし             → 期間開始時と同じ
     if changes_in:
         status_at_end = changes_in[-1]["to"]
+    elif changes_after:
+        status_at_end = changes_after[0]["from"]
     else:
         status_at_end = status_at_start
 
