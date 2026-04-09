@@ -1151,6 +1151,19 @@ def main():
         print(f"  ✅ サマリー保存: {summary_path}")
 
 
+def _issue_sort_key(issue: dict) -> tuple:
+    """課題番号を (プロジェクトキー, 番号) のタプルで返す数値ソート用キー"""
+    raw = issue.get("issueKey", "")
+    parts = raw.rsplit("-", 1)
+    if len(parts) == 2:
+        prefix, num_str = parts
+        try:
+            return (prefix, int(num_str))
+        except ValueError:
+            return (prefix, 0)
+    return (raw, 0)
+
+
 def _fmt_due(due_raw: str | None) -> str:
     """期限日を m/d 形式に変換（例: '2026-04-07T...' → '4/7'）"""
     if not due_raw:
@@ -1183,13 +1196,6 @@ def generate_summary_report(
             f"残:{len(carry_over)} / 新規:{len(new_issues)} / "
             f"再オープン:{len(reopened)} / 完了:{len(completed)} / 未完了:{len(incomplete)}"
         )
-
-        def _issue_sort_key(issue):
-            key = issue.get("issueKey", "")
-            try:
-                return int(key.rsplit("-", 1)[-1])
-            except ValueError:
-                return 0
 
         for issue in sorted(completed, key=_issue_sort_key):
             key    = issue.get("issueKey", "-")
