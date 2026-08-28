@@ -1,0 +1,27 @@
+[project]
+name = "backlog-weekly-report"
+version = "0.1.0"
+description = "Backlog の課題を期間集計して Markdown レポートを生成するスクリプト"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # 行長は line-length で管理（日本語コメントが多いため緩める）
+]

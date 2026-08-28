@@ -1,2 +1,16 @@
 .git-output.log
 config.yaml
+
+# 生成物
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Claude Code の作業ディレクトリ（git worktree を含む）
+.claude/
