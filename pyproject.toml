@@ -10,11 +10,26 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "pytest-cov>=5.0",
     "ruff>=0.4",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# カバレッジ計測は常時ではなく --cov を付けたときだけ実行する。
+#   python -m pytest tests/ --cov                    # 数値だけ
+#   python -m pytest tests/ --cov --cov-report=term-missing   # 未到達行も表示
+#   python -m pytest tests/ --cov --cov-report=html           # htmlcov/index.html
+[tool.coverage.run]
+source = ["backlog_weekly_report"]
+
+[tool.coverage.report]
+show_missing = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
 
 [tool.ruff]
 line-length = 120

@@ -292,7 +292,32 @@ reports/
 python -m pytest tests/ -v
 ```
 
-期間計算、フィルター解決、ステータス分類（JST 境界を含む）、API クライアントのリトライ／キャッシュを検証します。
+検証している範囲:
+
+- 集計期間の決定（`--from/--to` / `--week` / `config.period` / `target_week` の優先順位）
+- フィルター条件の解決（種別・カスタム属性）
+- ステータス分類（JST 境界、期間後にのみ変化した課題などの回帰）
+- API クライアント（リトライ、コメントキャッシュ、取得スキップ判定）
+- レポート出力の形式（`tests/golden/` に保存した出力との全文比較）
+- 旧実装との差分比較（`tests/_legacy.py` と突き合わせ、合成データ832ケース）
+
+### カバレッジの計測
+
+```bash
+python -m pytest tests/ --cov
+```
+
+未到達の行番号まで見る場合は `--cov-report=term-missing`、HTML で見る場合は
+`--cov-report=html` を付けます（`htmlcov/index.html` が生成されます）。
+
+### レポート出力の形式を変更したとき
+
+出力を意図的に変えた場合は、保存してある比較用ファイルを作り直します。
+生成された差分は必ず目視で確認してください。
+
+```bash
+python -m tests.regen_golden
+```
 
 ---
 
