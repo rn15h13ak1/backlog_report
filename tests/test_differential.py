@@ -1,0 +1,352 @@
+"""
+旧実装（cfcd9ff）との差分テスト。
+
+実 API に接続できない環境で回帰を検出するための代替手段。
+合成データを網羅的に生成し、新旧の実装を突き合わせて次の2点を機械的に確認する。
+
+  1. JST 補正以外にロジックの変化がないこと
+     新実装の結果 == 旧実装に「JST に補正済みの入力」を与えた結果
+
+  2. コメント取得スキップ最適化が集計結果を変えていないこと
+     タイムゾーン変換が無関係になる時刻（UTC 15時未満）だけで構成した
+     データセットでは、新旧の集計結果が完全一致すること
+
+比較対象の旧実装は tests/_legacy.py に凍結してある。
+
+合成データは Backlog の実データが満たす不変条件に従って生成する:
+  - ステータス変化は連鎖する（各変化の from は直前の変化の to と一致）
+  - 現在のステータスは最後の変化の to と一致する
+  - updated は「作成日と最終変化日の遅い方」以上である
+最後の条件はコメント取得スキップ最適化が依拠する前提そのものであり、
+これを破るデータでは新旧が食い違う（test_skip_optimization_precondition 参照）。
+"""
+import itertools
+from datetime import date
+
+import backlog_weekly_report as bwr
+from tests import _legacy
+
+PERIOD_START = date(2026, 3, 2)
+PERIOD_END = date(2026, 3, 8)
+
+STATUSES = [
+    {"id": 1, "name": "未対応"},
+    {"id": 2, "name": "処理中"},
+    {"id": 3, "name": "処理済み"},
+    {"id": 4, "name": "完了"},
+]
+OPEN_NAMES = {"未対応", "処理中"}
+CLOSED_NAMES = {"処理済み", "完了"}
+ALL_NAMES = ["未対応", "処理中", "処理済み", "完了"]
+
+CLASSIFY_KEYS = ("is_carry_over", "is_new", "is_reopened", "is_completed",
+                 "status_at_start", "status_at_end")
+
+# 期間: 2026-03-02 〜 2026-03-08。境界日を意図的に含める。
+D_OLD = "2026-01-15"        # ずっと前
+D_PREV = "2026-03-01"       # 期間開始の前日（JST 補正で期間内に入りうる）
+D_START = "2026-03-02"      # 期間開始日
+D_MID = "2026-03-05"        # 期間中
+D_END = "2026-03-08"        # 期間終了日（JST 補正で期間外に出うる）
+D_NEXT = "2026-03-09"       # 期間終了の翌日
+D_LATER = "2026-03-20"      # ずっと後
+
+CREATED_DAYS = [D_OLD, D_PREV, D_START, D_MID, D_END, D_NEXT]
+
+# ステータス変化のシナリオ: (日付, 遷移後ステータス) の列。
+# from は直前の状態から自動的に連鎖させる。
+STEP_SCENARIOS = [
+    [],
+    [(D_OLD, "処理中")],
+    [(D_PREV, "完了")],
+    [(D_START, "完了")],
+    [(D_MID, "完了")],
+    [(D_MID, "処理済み")],
+    [(D_END, "完了")],
+    [(D_NEXT, "完了")],
+    [(D_LATER, "完了")],
+    [(D_MID, "処理済み"), (D_END, "完了")],            # 完了系→完了系
+    [(D_OLD, "完了"), (D_MID, "処理中")],              # 期間中に再オープン
+    [(D_MID, "完了"), (D_END, "未対応")],              # 完了後に再オープン
+    [(D_OLD, "完了"), (D_MID, "処理中"), (D_END, "完了")],   # 再オープン後に再完了
+    [(D_PREV, "処理中"), (D_LATER, "完了")],           # 期間前と期間後のみ
+    [(D_START, "処理中"), (D_END, "完了")],            # 境界日で開始・終了
+]
+
+HOURS = ["02", "14", "15", "23"]   # UTC 15時以降は JST では翌日になる
+
+
+# ==================================================================
+# 合成データ生成
+# ==================================================================
+
+def at(day: str, hour: str) -> str:
+    return f"{day}T{hour}:00:00Z"
+
+
+def to_jst_iso(iso: str) -> str:
+    """
+    旧実装に食わせるための JST 補正済み入力を作る。
+    旧実装は先頭10文字しか見ないため、日付部分だけ JST に直せば等価。
+    """
+    return bwr.to_local_date(iso) + "T00:00:00Z"
+
+
+def build_chain(initial: str, steps: list) -> tuple[list, str]:
+    """(日付, 遷移後) の列から (日付, from, to) の連鎖と最終ステータスを作る"""
+    current = initial
+    changes = []
+    for day, to_status in steps:
+        changes.append((day, current, to_status))
+        current = to_status
+    return changes, current
+
+
+def scenarios(hour: str):
+    """
+    不変条件を満たす (issue, comments) を網羅的に生成する。
+    作成日より前の変化を持つ組み合わせは非現実的なので除外する。
+    """
+    issue_id = 0
+    for created_day, initial, steps in itertools.product(
+        CREATED_DAYS, ALL_NAMES, STEP_SCENARIOS
+    ):
+        if any(day < created_day for day, _ in steps):
+            continue
+        changes, final_status = build_chain(initial, steps)
+        issue_id += 1
+        last_day = max([created_day] + [day for day, _, _ in changes])
+        issue = {
+            "id": issue_id,
+            "issueKey": f"PRJ-{issue_id}",
+            "created": at(created_day, hour),
+            "updated": at(last_day, hour),
+            "status": {"name": final_status},
+            "summary": f"課題{issue_id}",
+            "assignee": None,
+            "dueDate": None,
+        }
+        comments = [
+            {
+                "id": idx + 1,
+                "created": at(day, hour),
+                "changeLog": [{"field": "status", "originalValue": src, "newValue": dst}],
+            }
+            for idx, (day, src, dst) in enumerate(changes)
+        ]
+        yield issue, comments
+
+
+def shift_issue(issue: dict) -> dict:
+    shifted = {**issue, "created": to_jst_iso(issue["created"])}
+    if "updated" in issue:
+        shifted["updated"] = to_jst_iso(issue["updated"])
+    return shifted
+
+
+def shift_comments(comments: list) -> list:
+    return [{**c, "created": to_jst_iso(c["created"])} for c in comments]
+
+
+def new_classify(issue, comments):
+    return bwr.classify_issue_from_comments(
+        issue, comments, PERIOD_START, PERIOD_END, CLOSED_NAMES, OPEN_NAMES
+    )
+
+
+def old_classify(issue, comments):
+    return _legacy.classify_issue_from_comments(
+        issue, comments, PERIOD_START, PERIOD_END, CLOSED_NAMES, OPEN_NAMES
+    )
+
+
+def describe(issue, comments) -> str:
+    changes = [(c["created"][:10], c["changeLog"][0]["originalValue"],
+                c["changeLog"][0]["newValue"]) for c in comments]
+    return (f"{issue['issueKey']} created={issue['created']} "
+            f"updated={issue['updated']} status={issue['status']['name']} changes={changes}")
+
+
+# ==================================================================
+# 1. 分類ロジック: JST 補正以外に差がないこと
+# ==================================================================
+
+def test_classification_differs_only_by_timezone():
+    """新実装 == 旧実装（入力を JST に補正したもの）を全シナリオで確認する"""
+    mismatches = []
+    total = 0
+    for hour in HOURS:
+        for issue, comments in scenarios(hour):
+            total += 1
+            new_result = new_classify(issue, comments)
+            old_result = old_classify(shift_issue(issue), shift_comments(comments))
+            diff = {k: (new_result[k], old_result[k])
+                    for k in CLASSIFY_KEYS if new_result[k] != old_result[k]}
+            if diff:
+                mismatches.append((describe(issue, comments), diff))
+
+    # ジェネレータが黙って空を返す退行の検出用（実測 832 件）
+    assert total > 500, f"生成ケースが少なすぎる: {total}"
+    assert not mismatches, (
+        f"{len(mismatches)}/{total} 件で新旧が不一致:\n"
+        + "\n".join(f"  {d}\n    {diff}" for d, diff in mismatches[:5])
+    )
+
+
+def test_corpus_actually_exercises_the_timezone_boundary():
+    """
+    上のテストが素通りしていないことの確認。
+    UTC 15時以降のケースでは、補正しない旧実装と新実装が実際に食い違う組み合わせが
+    存在しなければならない（存在しなければ境界日を踏めていない）。
+    """
+    divergences = 0
+    for hour in ("15", "23"):
+        for issue, comments in scenarios(hour):
+            new_result = new_classify(issue, comments)
+            old_result = old_classify(issue, comments)   # 補正せずそのまま渡す
+            if any(new_result[k] != old_result[k] for k in CLASSIFY_KEYS):
+                divergences += 1
+    assert divergences > 0, "JST 境界を踏むケースが1件も無い（テストデータが不十分）"
+
+
+def test_no_divergence_when_timezone_conversion_is_a_noop():
+    """UTC 15時未満なら JST 変換は日付を動かさないので、補正なしでも新旧一致する"""
+    for hour in ("02", "14"):
+        for issue, comments in scenarios(hour):
+            new_result = new_classify(issue, comments)
+            old_result = old_classify(issue, comments)
+            for key in CLASSIFY_KEYS:
+                assert new_result[key] == old_result[key], describe(issue, comments)
+
+
+# ==================================================================
+# 2. 集計全体: コメント取得スキップ最適化が結果を変えないこと
+# ==================================================================
+
+class RecordingClient(bwr.BacklogClient):
+    """合成データを返し、コメント取得回数を記録する疑似クライアント"""
+
+    def __init__(self, issues: list, comments_by_id: dict):
+        super().__init__("example.test", "key")
+        self.issues = issues
+        self.comments_by_id = comments_by_id
+        self.fetch_count = 0
+
+    def get_statuses(self, project_id_or_key):
+        return STATUSES
+
+    def get_issues(self, project_id, params=None):
+        return self.issues
+
+    def get_issue_comments(self, issue_id):
+        self.fetch_count += 1
+        return self.comments_by_id.get(issue_id, [])
+
+
+def build_corpus(hour: str) -> tuple[list, dict]:
+    issues, comments_by_id = [], {}
+    for issue, comments in scenarios(hour):
+        issues.append(issue)
+        comments_by_id[issue["id"]] = comments
+    return issues, comments_by_id
+
+
+def categorize(data: dict) -> dict:
+    """比較用に {カテゴリ: [(課題番号, 表示ステータス)]} へ正規化"""
+    return {
+        key: sorted((i["issueKey"], i["status"]["name"]) for i in data[key])
+        for key in ("carry_over", "new_issues", "reopened", "completed", "incomplete")
+    }
+
+
+def run_new(issues, comments_by_id):
+    client = RecordingClient(issues, comments_by_id)
+    data = bwr.collect_report_data(
+        client, "PRJ", 1, PERIOD_START, PERIOD_END,
+        bwr.DEFAULT_OPEN_STATUS_IDS, bwr.DEFAULT_CLOSED_STATUS_IDS, max_workers=4,
+    )
+    return data, client
+
+
+def run_old(issues, comments_by_id):
+    client = RecordingClient(issues, comments_by_id)
+    data = _legacy.collect_report_data(
+        client, "PRJ", 1, PERIOD_START, PERIOD_END,
+        bwr.DEFAULT_OPEN_STATUS_IDS, bwr.DEFAULT_CLOSED_STATUS_IDS,
+    )
+    return data, client
+
+
+def test_aggregation_identical_when_timezone_is_irrelevant():
+    """
+    UTC 02:00 のデータのみ（JST に直しても日付が変わらない）で新旧を比較する。
+    タイムゾーン補正の影響が消えるため、差が出ればスキップ最適化かリファクタの退行。
+    """
+    issues, comments_by_id = build_corpus("02")
+    new_data, _ = run_new(issues, comments_by_id)
+    old_data, _ = run_old(issues, comments_by_id)
+    assert categorize(new_data) == categorize(old_data)
+
+
+def test_aggregation_identical_with_shifted_input_at_boundary():
+    """UTC 23:00 のデータでも、旧実装に JST 補正済み入力を与えれば一致する"""
+    issues, comments_by_id = build_corpus("23")
+    new_data, _ = run_new(issues, comments_by_id)
+    old_data, _ = run_old(
+        [shift_issue(i) for i in issues],
+        {k: shift_comments(v) for k, v in comments_by_id.items()},
+    )
+    assert categorize(new_data) == categorize(old_data)
+
+
+def test_optimization_actually_skips_fetches():
+    """スキップ最適化が実際に効いていること（効いていなければ比較の意味がない）"""
+    issues, comments_by_id = build_corpus("02")
+    _, new_client = run_new(issues, comments_by_id)
+    _, old_client = run_old(issues, comments_by_id)
+    assert old_client.fetch_count == len(issues)
+    assert new_client.fetch_count < old_client.fetch_count
+
+
+def test_equation_holds_across_corpus():
+    """整合したデータでは全シナリオで ①+②+③ = ④+⑤ が成立すること"""
+    for hour in HOURS:
+        issues, comments_by_id = build_corpus(hour)
+        data, _ = run_new(issues, comments_by_id)
+        lhs = len(data["carry_over"]) + len(data["new_issues"]) + len(data["reopened"])
+        rhs = len(data["completed"]) + len(data["incomplete"])
+        assert lhs == rhs, f"hour={hour}: {lhs} != {rhs}"
+
+
+def test_skip_optimization_precondition():
+    """
+    スキップ最適化が依拠する前提を明示しておく。
+
+    updated が最終ステータス変更より古い（Backlog では起きない）データでは、
+    新実装はコメントを取得せず現在のステータスを採用するため、
+    履歴から導出する旧実装と結果が食い違う。
+    この差は最適化の欠陥ではなく前提条件の破れであることを記録しておく。
+    """
+    issue = {
+        "id": 1, "issueKey": "PRJ-1",
+        "created": "2026-01-15T02:00:00Z",
+        "updated": "2026-01-15T02:00:00Z",     # 変化を反映していない古い値
+        "status": {"name": "処理済み"},          # 履歴の最終状態（処理中）と矛盾
+        "summary": "不整合データ", "assignee": None, "dueDate": None,
+    }
+    comments = [{
+        "id": 1, "created": "2026-01-15T02:00:00Z",
+        "changeLog": [{"field": "status", "originalValue": "未対応", "newValue": "処理中"}],
+    }]
+
+    new_data, new_client = run_new([issue], {1: comments})
+    old_data, _ = run_old([issue], {1: comments})
+
+    assert new_client.fetch_count == 0                      # スキップされる
+    assert categorize(new_data) != categorize(old_data)     # よって食い違う
+
+    # updated を正しく（最終変化以降に）すれば一致する
+    fixed = {**issue, "updated": "2026-03-05T02:00:00Z"}
+    fixed_data, fixed_client = run_new([fixed], {1: comments})
+    assert fixed_client.fetch_count == 1
+    assert categorize(fixed_data) == categorize(old_data)
