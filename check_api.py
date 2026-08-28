@@ -1,125 +1,139 @@
 #!/usr/bin/env python3
 """
-/issues/{id}/activities エンドポイントの動作確認スクリプト
-config.yaml の設定を読み込んで実際にリクエストを送信します。
+Backlog API 接続診断スクリプト
+config.yaml の設定を読み込んで実際にリクエストを送信し、
+週次レポート生成に必要なエンドポイントが利用できるかを確認します。
+
+  python check_api.py
+  python check_api.py --config path/to/config.yaml
 """
+import argparse
 import sys
-import ssl
-import json
-import urllib.request
-import urllib.parse
-import yaml
+from pathlib import Path
 
-# config.yaml を読み込む
-with open("config.yaml", encoding="utf-8") as f:
-    config = yaml.safe_load(f)
+from backlog_weekly_report import (
+    DEFAULT_CLOSED_STATUS_IDS,
+    DEFAULT_OPEN_STATUS_IDS,
+    BacklogAPIError,
+    BacklogClient,
+    format_api_error,
+    load_config,
+    to_local_date,
+    validate_backlog_config,
+)
 
-bl = config["backlog"]
-host      = bl["space_host"]
-api_key   = bl["api_key"]
-base_path = ("/" + bl.get("base_path", "").strip("/")) if bl.get("base_path", "").strip("/") else ""
-ssl_verify = bl.get("ssl_verify", True)
-project_key = bl["project_key"]
 
-report_cfg = config.get("report", {})
-closed_status_ids = report_cfg.get("closed_status_ids", [3, 4])
-open_status_ids   = report_cfg.get("open_status_ids",   [1, 2])
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Backlog API 接続診断")
+    parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"),
+                        help="設定ファイルのパス（デフォルト: スクリプトと同じディレクトリの config.yaml）")
+    parser.add_argument("--debug", action="store_true", help="APIリクエストのパラメータを表示する")
+    args = parser.parse_args()
 
-base_url = f"https://{host}{base_path}/api/v2"
+    config = load_config(args.config)
+    backlog_cfg = config.get("backlog", {})
+    report_cfg = config.get("report", {})
 
-# SSL設定
-if ssl_verify:
-    ctx = None
-else:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    space_host, api_key, project_key = validate_backlog_config(backlog_cfg)
+    closed_status_ids = report_cfg.get("closed_status_ids", DEFAULT_CLOSED_STATUS_IDS)
+    open_status_ids   = report_cfg.get("open_status_ids",   DEFAULT_OPEN_STATUS_IDS)
 
-def get(endpoint, params=None):
-    params = params or {}
-    params["apiKey"] = api_key
-    parts = []
-    for k, v in params.items():
-        if isinstance(v, list):
-            for item in v:
-                parts.append(f"{urllib.parse.quote(k)}%5B%5D={urllib.parse.quote(str(item))}")
-        else:
-            parts.append(f"{urllib.parse.quote(k)}={urllib.parse.quote(str(v))}")
-    qs = "&".join(parts)
-    url = f"{base_url}{endpoint}?{qs}"
-    print(f"  → {endpoint}?{qs.replace(api_key, '***')}")
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=15, context=ctx) as res:
-        return json.loads(res.read().decode("utf-8"))
+    client = BacklogClient(
+        space_host,
+        api_key,
+        ssl_verify=backlog_cfg.get("ssl_verify", True),
+        base_path=backlog_cfg.get("base_path", ""),
+        debug=args.debug,
+    )
 
-print(f"接続先: {base_url}")
-print(f"プロジェクト: {project_key}")
-print()
+    print(f"接続先: {client.base_url}")
+    print(f"プロジェクト: {project_key}")
+    print(f"オープン系ステータスID: {open_status_ids} / 完了系ステータスID: {closed_status_ids}")
+    print()
 
-# Step0: 接続・認証確認（/space は最もシンプルなエンドポイント）
-print("=== Step0: 接続・認証確認 ===")
-try:
-    space = get("/space")
-    print(f"✅ 接続OK: {space.get('name', space)}")
-except Exception as e:
-    print(f"❌ 接続失敗: {e}")
-    print("  → space_host / base_path / api_key / ssl_verify を確認してください")
-    sys.exit(1)
-print()
+    # ---- Step1: 接続・認証確認（/space は最もシンプルなエンドポイント）----
+    print("=== Step1: 接続・認証確認 ===")
+    try:
+        space = client._get("/space")
+        print(f"✅ 接続OK: {space.get('name', space)}")
+    except BacklogAPIError as e:
+        print("❌ 接続失敗")
+        print(format_api_error(e), file=sys.stderr)
+        print("  → space_host / base_path / api_key / ssl_verify を確認してください")
+        sys.exit(1)
+    print()
 
-# Step1: プロジェクト情報を取得して project_id と issue を1件取得
-print("=== Step1: 課題を1件取得 ===")
-print(f"  project_key の値: [{project_key}]")
-try:
-    project = get(f"/projects/{project_key}")
-    print(f"✅ プロジェクト取得OK: {project.get('name')} (id={project.get('id')})")
-except Exception as e:
-    print(f"❌ プロジェクト取得失敗: {e}")
-    print("  → project_key を確認してください")
-    sys.exit(1)
-project_id = project.get("id")
-# ステータス変化を確認しやすいよう完了済み課題を優先して取得
-issues = get("/issues", {"projectId": [project_id], "statusId": closed_status_ids, "count": 1})
-if not issues:
-    # 完了済みがなければ全ステータスで取得
-    issues = get("/issues", {"projectId": [project_id], "count": 1})
-if not issues:
-    print("課題が1件も見つかりませんでした。")
-    sys.exit(1)
+    # ---- Step2: プロジェクト情報とステータス一覧 ----
+    print("=== Step2: プロジェクト情報・ステータス一覧 ===")
+    try:
+        project = client.get_project(project_key)
+        print(f"✅ プロジェクト取得OK: {project.get('name')} (id={project.get('id')})")
+    except BacklogAPIError as e:
+        print("❌ プロジェクト取得失敗")
+        print(format_api_error(e), file=sys.stderr)
+        print("  → project_key を確認してください")
+        sys.exit(1)
+    project_id = project.get("id")
 
-issue = issues[0]
-issue_id  = issue["id"]
-issue_key = issue["issueKey"]
-print(f"取得した課題: {issue_key} (id={issue_id}, status={issue.get('status', {}).get('name')})")
-print()
+    try:
+        statuses = client.get_statuses(project_key)
+        known_ids = set(open_status_ids) | set(closed_status_ids)
+        for s in statuses:
+            if s["id"] in open_status_ids:
+                label = "オープン系"
+            elif s["id"] in closed_status_ids:
+                label = "完了系"
+            else:
+                label = "⚠ 未分類（config.yaml に未設定）"
+            print(f"   id={s['id']}: {s['name']}  → {label}")
+        missing = [s for s in statuses if s["id"] not in known_ids]
+        if missing:
+            print("   ⚠ 未分類のステータスがあります。open_status_ids / closed_status_ids を見直してください。")
+    except BacklogAPIError as e:
+        print("❌ ステータス一覧の取得に失敗")
+        print(format_api_error(e), file=sys.stderr)
+    print()
 
-# Step2: /issues/{id}/activities を試す
-print("=== Step2: /issues/{id}/activities エンドポイント確認 ===")
-try:
-    activities = get(f"/issues/{issue_id}/activities", {"count": 1})
-    print(f"✅ エンドポイント有効。取得件数: {len(activities)}")
-    if activities:
-        print(f"   サンプル: type={activities[0].get('type')}, created={activities[0].get('created', '')[:10]}")
-except Exception as e:
-    print(f"❌ エンドポイント無効またはエラー: {e}")
-print()
+    # ---- Step3: 課題を1件取得 ----
+    print("=== Step3: 課題を1件取得 ===")
+    # ステータス変化を確認しやすいよう完了済み課題を優先して取得
+    issues = client._get("/issues", {"projectId": [project_id], "statusId": closed_status_ids, "count": 1})
+    if not issues:
+        # 完了済みがなければ全ステータスで取得
+        issues = client._get("/issues", {"projectId": [project_id], "count": 1})
+    if not issues:
+        print("課題が1件も見つかりませんでした。")
+        sys.exit(1)
 
-# Step3: /issues/{id}/comments を試す（changeLog にステータス変化が含まれる可能性）
-print("=== Step3: /issues/{id}/comments エンドポイント確認 ===")
-try:
-    comments = get(f"/issues/{issue_id}/comments", {"count": 20, "order": "desc"})
+    issue = issues[0]
+    issue_id = issue["id"]
+    print(f"取得した課題: {issue['issueKey']} (id={issue_id}, "
+          f"status={issue.get('status', {}).get('name')}, "
+          f"created={to_local_date(issue.get('created', ''))} JST)")
+    print()
+
+    # ---- Step4: コメントの changeLog にステータス変化が記録されているか ----
+    print("=== Step4: /issues/{id}/comments の changeLog 確認 ===")
+    try:
+        comments = client._get(f"/issues/{issue_id}/comments", {"count": 20, "order": "desc"})
+    except BacklogAPIError as e:
+        print("❌ エンドポイント無効またはエラー")
+        print(format_api_error(e), file=sys.stderr)
+        sys.exit(1)
+
     print(f"✅ エンドポイント有効。取得件数: {len(comments)}")
-    status_changes = []
-    for c in comments:
-        for cl in c.get("changeLog", []):
-            if cl.get("field") == "status":
-                status_changes.append({
-                    "date": c.get("created", "")[:10],
-                    "from": cl.get("originalValue"),
-                    "to":   cl.get("newValue"),
-                })
+    status_changes = [
+        {
+            "date": to_local_date(c.get("created", "")),
+            "from": cl.get("originalValue"),
+            "to":   cl.get("newValue"),
+        }
+        for c in comments
+        for cl in c.get("changeLog", [])
+        if cl.get("field") == "status"
+    ]
     if status_changes:
-        print(f"   ステータス変化の記録あり（直近{len(status_changes)}件）:")
+        print(f"   ステータス変化の記録あり（直近{len(status_changes)}件・日付はJST）:")
         for sc in status_changes:
             print(f"     {sc['date']}: {sc['from']} → {sc['to']}")
     else:
@@ -129,5 +143,11 @@ try:
         print(f"   changeLog フィールド: {'あり' if has_changelog else 'なし（コメント構造が異なる可能性）'}")
         if comments:
             print(f"   コメント構造サンプル: {list(comments[0].keys())}")
-except Exception as e:
-    print(f"❌ エンドポイント無効またはエラー: {e}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BacklogAPIError as e:
+        print(format_api_error(e), file=sys.stderr)
+        sys.exit(1)
