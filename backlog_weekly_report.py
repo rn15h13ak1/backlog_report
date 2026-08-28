@@ -14,6 +14,10 @@ config.yaml の filters に複数のフィルターを定義すると、
   ⑤ 当週未完了件数: ① + ② + ③ のうち④で完了しなかった課題（等式: ① + ② + ③ = ④ + ⑤）
   各カテゴリのBacklog課題番号一覧も出力
 
+日時の扱い:
+  Backlog API は日時を UTC で返すため、日付の判定はすべて JST（UTC+9）に
+  変換してから行います。
+
 使い方:
   # 前週を自動計算して集計（デフォルト）
   python backlog_weekly_report.py
@@ -29,21 +33,109 @@ config.yaml の filters に複数のフィルターを定義すると、
 """
 
 import argparse
-import sys
-import ssl
-import time
-import urllib.request
-import urllib.parse
-import urllib.error
 import json
-import yaml
-from datetime import datetime, timedelta, date
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+import yaml
+
+# ==============================================================
+# 定数
+# ==============================================================
+
+# Backlog API は UTC で日時を返すため、日付判定は JST に変換して行う
+JST = timezone(timedelta(hours=9))
+
+# ステータスIDの既定値（config.sample.yaml / README と一致させること）
+#   1=未対応, 2=処理中 → オープン系 / 3=処理済み, 4=完了 → 完了系
+DEFAULT_OPEN_STATUS_IDS = [1, 2]
+DEFAULT_CLOSED_STATUS_IDS = [3, 4]
+
+# コメント取得の並列度の既定値
+DEFAULT_MAX_WORKERS = 4
+
+API_TIMEOUT = 30       # 1リクエストのタイムアウト（秒）
+API_MAX_RETRIES = 3    # 一時的な失敗に対する最大リトライ回数
+API_PAGE_SIZE = 100    # Backlog API の1回あたり最大取得件数
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# レポート表示上限
+TABLE_MAX_DISPLAY = 30
+TABLE_MAX_DISPLAY_INCOMPLETE = 50
+KEYS_MAX_DISPLAY = 20
+
+
+def to_local_date(iso: str) -> str:
+    """
+    Backlog が返す UTC の ISO 日時を JST の 'YYYY-MM-DD' 文字列に変換する。
+
+    例: '2026-04-07T15:30:00Z' → '2026-04-08'（JST では翌日）
+
+    パースできない値は従来どおり先頭10文字をそのまま返す。
+    """
+    if not iso:
+        return ""
+    try:
+        dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return iso[:10]
+    return dt.astimezone(JST).date().isoformat()
 
 
 # ==============================================================
 # Backlog API クライアント
 # ==============================================================
+
+class BacklogAPIError(Exception):
+    """Backlog API 呼び出しの失敗を表す例外"""
+
+    def __init__(self, endpoint: str, status_code: int | None = None,
+                 detail: str = "", raw_body: str = ""):
+        self.endpoint = endpoint
+        self.status_code = status_code
+        self.detail = detail
+        self.raw_body = raw_body
+        super().__init__(f"{endpoint} (HTTP {status_code})" if status_code else f"{endpoint}: {detail}")
+
+
+def format_api_error(err: BacklogAPIError) -> str:
+    """BacklogAPIError を利用者向けの日本語メッセージに整形する"""
+    # エンドポイントのみ表示（APIキーを含むURLは表示しない）
+    if err.status_code is None:
+        lines = [f"エラー: API へ接続できませんでした: {err.endpoint}"]
+        if err.detail:
+            lines.append(f"  詳細: {err.detail}")
+        lines.append("  → space_host / base_path / ネットワーク接続を確認してください。")
+        return "\n".join(lines)
+
+    lines = [f"エラー: API呼び出しに失敗しました（HTTP {err.status_code}）: {err.endpoint}"]
+    if err.detail:
+        lines.append(f"  詳細: {err.detail}")
+    elif err.raw_body:
+        # detailが取れない場合はボディをそのまま表示（デバッグ用）
+        lines.append(f"  レスポンス: {err.raw_body[:500]}")
+
+    if err.status_code == 400:
+        lines.append("  → リクエストパラメータを確認してください。")
+        lines.append("    フィルターの field_name / field_id や values の値が正しいか確認してください。")
+    elif err.status_code == 401:
+        lines.append("  → api_key を確認してください。")
+    elif err.status_code == 403:
+        lines.append("  → api_key の権限を確認してください。")
+    elif err.status_code == 404:
+        lines.append("  → space_host または project_key を確認してください。")
+    elif err.status_code in RETRYABLE_STATUS:
+        lines.append(f"  → リトライ({API_MAX_RETRIES}回)しても回復しませんでした。時間をおいて再実行してください。")
+    return "\n".join(lines)
+
 
 class BacklogClient:
     def __init__(self, space_host: str, api_key: str, ssl_verify: bool = True, base_path: str = "", debug: bool = False):
@@ -60,9 +152,17 @@ class BacklogClient:
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
 
-    def _get(self, endpoint: str, params: dict = None) -> dict | list:
-        """GETリクエストを送信してJSONを返す"""
-        params = params or {}
+        # 実行中のコメントキャッシュ（フィルター間で課題が重複しても取得は1回）
+        self._comment_cache: dict[int, list] = {}
+        self._comment_lock = threading.Lock()
+        # コメント取得に失敗した課題ID（集計後に警告表示する）
+        self.comment_failures: set[int] = set()
+
+    # ---------------- 低レベル HTTP ----------------
+
+    def _build_url(self, endpoint: str, params: dict) -> tuple[str, list[str]]:
+        """URL とデバッグ表示用のクエリ部品リストを組み立てる"""
+        params = dict(params or {})
         params["apiKey"] = self.api_key
 
         # リストパラメータを展開（例: statusId[] → statusId%5B%5D=1&statusId%5B%5D=2）
@@ -74,53 +174,77 @@ class BacklogClient:
                     query_parts.append(f"{urllib.parse.quote(key)}%5B%5D={urllib.parse.quote(str(v))}")
             else:
                 query_parts.append(f"{urllib.parse.quote(key)}={urllib.parse.quote(str(value))}")
-        query_string = "&".join(query_parts)
 
-        url = f"{self.base_url}{endpoint}?{query_string}"
+        url = f"{self.base_url}{endpoint}?" + "&".join(query_parts)
+        # APIキーを除いた部品（デバッグ表示用）
+        return url, [p for p in query_parts if not p.startswith("apiKey=")]
+
+    @staticmethod
+    def _http_error_to_api_error(e: urllib.error.HTTPError, endpoint: str) -> BacklogAPIError:
+        """HTTPError からレスポンスボディの詳細を取り出して BacklogAPIError に変換する"""
+        detail = ""
+        raw_body = ""
+        try:
+            raw_body = e.read().decode("utf-8")
+            body = json.loads(raw_body)
+            errors = body.get("errors", [])
+            if errors:
+                detail = " / ".join(
+                    f"{err.get('message', '')}（code={err.get('code')}）"
+                    for err in errors
+                )
+        except Exception:
+            pass
+        return BacklogAPIError(endpoint, status_code=e.code, detail=detail, raw_body=raw_body)
+
+    def _sleep_before_retry(self, attempt: int, retry_after: str | None) -> None:
+        """指数バックオフ（Retry-After ヘッダがあれば優先）"""
+        delay = 2 ** attempt  # 1, 2, 4 秒
+        if retry_after:
+            try:
+                delay = max(delay, min(float(retry_after), 60.0))
+            except ValueError:
+                pass
+        if self.debug:
+            print(f"  [DEBUG] {delay:.1f}秒待機してリトライします（{attempt + 1}/{API_MAX_RETRIES}）",
+                  file=sys.stderr)
+        time.sleep(delay)
+
+    def _get(self, endpoint: str, params: dict | None = None) -> dict | list:
+        """
+        GETリクエストを送信してJSONを返す。
+
+        429 / 5xx / 接続エラーは指数バックオフで最大 API_MAX_RETRIES 回リトライする。
+        最終的に失敗した場合は BacklogAPIError を送出する（プロセスは終了しない）。
+        """
+        url, debug_parts = self._build_url(endpoint, params)
 
         if self.debug:
-            # APIキーを除いたパラメータを表示
-            debug_parts = [p for p in query_parts if not p.startswith("apiKey=")]
             print(f"  [DEBUG] {endpoint} ?" + "&".join(debug_parts), file=sys.stderr)
 
-        req = urllib.request.Request(url)
-        try:
-            with urllib.request.urlopen(req, timeout=30, context=self.ssl_context) as res:
-                return json.loads(res.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            # レスポンスボディから詳細メッセージを取得
-            detail = ""
-            raw_body = ""
+        for attempt in range(API_MAX_RETRIES + 1):
             try:
-                raw_body = e.read().decode("utf-8")
-                body = json.loads(raw_body)
-                errors = body.get("errors", [])
-                if errors:
-                    detail = " / ".join(
-                        f"{err.get('message', '')}（code={err.get('code')}）"
-                        for err in errors
-                    )
-            except Exception:
-                pass
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=API_TIMEOUT, context=self.ssl_context) as res:
+                    return json.loads(res.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                err = self._http_error_to_api_error(e, endpoint)
+                if err.status_code in RETRYABLE_STATUS and attempt < API_MAX_RETRIES:
+                    self._sleep_before_retry(attempt, retry_after)
+                    continue
+                raise err from None
+            except (urllib.error.URLError, TimeoutError) as e:
+                reason = getattr(e, "reason", e)
+                if attempt < API_MAX_RETRIES:
+                    self._sleep_before_retry(attempt, None)
+                    continue
+                raise BacklogAPIError(endpoint, status_code=None, detail=str(reason)) from None
 
-            # エンドポイントのみ表示（APIキーを含むURLは表示しない）
-            print(f"エラー: API呼び出しに失敗しました（HTTP {e.code}）: {endpoint}", file=sys.stderr)
-            if detail:
-                print(f"  詳細: {detail}", file=sys.stderr)
-            elif raw_body:
-                # detailが取れない場合はボディをそのまま表示（デバッグ用）
-                print(f"  レスポンス: {raw_body[:500]}", file=sys.stderr)
+        # ここには到達しない（ループ内で return または raise される）
+        raise BacklogAPIError(endpoint, status_code=None, detail="リトライ上限に達しました")
 
-            if e.code == 400:
-                print("  → リクエストパラメータを確認してください。", file=sys.stderr)
-                print("    フィルターの field_name / field_id や values の値が正しいか確認してください。", file=sys.stderr)
-            elif e.code == 401:
-                print("  → api_key を確認してください。", file=sys.stderr)
-            elif e.code == 403:
-                print("  → api_key の権限を確認してください。", file=sys.stderr)
-            elif e.code == 404:
-                print("  → space_host または project_key を確認してください。", file=sys.stderr)
-            sys.exit(1)
+    # ---------------- エンドポイント ----------------
 
     def get_project(self, project_key: str) -> dict:
         """プロジェクト情報を取得"""
@@ -138,67 +262,74 @@ class BacklogClient:
         """プロジェクトのステータス一覧を取得"""
         return self._get(f"/projects/{project_id_or_key}/statuses")
 
-    def get_issues(self, project_id: int, params: dict = None) -> list:
+    def get_issues(self, project_id: int, params: dict | None = None) -> list:
         """
         課題一覧を全件取得（ページネーション対応）
         Backlog APIは1回最大100件のため、自動的に繰り返し取得します。
         """
         all_issues = []
         offset = 0
-        count = 100
 
-        base_params = params or {}
+        # 呼び出し元の dict を書き換えないようコピーする
+        base_params = dict(params or {})
         base_params["projectId"] = [project_id]
-        base_params["count"] = count
+        base_params["count"] = API_PAGE_SIZE
 
         while True:
             base_params["offset"] = offset
-            issues = self._get("/issues", base_params.copy())
+            issues = self._get("/issues", base_params)
             if not issues:
                 break
             all_issues.extend(issues)
-            if len(issues) < count:
+            if len(issues) < API_PAGE_SIZE:
                 break
-            offset += count
-            time.sleep(0.3)  # APIレート制限を考慮
+            offset += API_PAGE_SIZE
 
         return all_issues
-
-    def get_issue_by_id(self, issue_id: int) -> dict | None:
-        """課題IDで単一課題を取得。取得失敗時は None を返す"""
-        try:
-            return self._get(f"/issues/{issue_id}")
-        except Exception as e:
-            if self.debug:
-                print(f"  [DEBUG] get_issue_by_id({issue_id}) 失敗: {e}", file=sys.stderr)
-            return None
 
     def get_issue_comments(self, issue_id: int) -> list:
         """
         課題のコメントを全件取得（ページネーション対応）。
         コメントの changeLog にステータス変化履歴が含まれる。
+
+        取得に失敗した場合は comment_failures に課題IDを記録し、
+        その時点までに取得できた分を返す（1課題の失敗で全体を止めない）。
         """
-        all_comments = []
+        with self._comment_lock:
+            cached = self._comment_cache.get(issue_id)
+        if cached is not None:
+            return cached
+
+        all_comments: list = []
         min_id = None
+        failed = False
 
         while True:
-            params: dict = {"count": 100, "order": "asc"}
+            params: dict = {"count": API_PAGE_SIZE, "order": "asc"}
             if min_id is not None:
                 params["minId"] = min_id
             try:
                 comments = self._get(f"/issues/{issue_id}/comments", params)
-            except Exception as e:
+            except BacklogAPIError as e:
+                failed = True
                 if self.debug:
                     print(f"  [DEBUG] get_issue_comments({issue_id}) 失敗: {e}", file=sys.stderr)
                 break
             if not comments:
                 break
             all_comments.extend(comments)
-            if len(comments) < 100:
+            if len(comments) < API_PAGE_SIZE:
                 break
             min_id = max(c["id"] for c in comments) + 1
-            time.sleep(0.3)
 
+        if failed:
+            with self._comment_lock:
+                self.comment_failures.add(issue_id)
+            # 不完全な結果はキャッシュしない
+            return all_comments
+
+        with self._comment_lock:
+            self._comment_cache[issue_id] = all_comments
         return all_comments
 
 
@@ -225,14 +356,16 @@ WEEK_START_MAP = {
 }
 
 
-def get_week_range(target_week: str, week_start: str) -> tuple[date, date]:
+def get_week_range(target_week: str, week_start: str, today: date | None = None) -> tuple[date, date]:
     """
     対象週の開始日と終了日を返す（date型）
 
     target_week: "previous" or "current"
     week_start:  曜日名（"monday"〜"sunday" または "月"〜"日"）
+    today:       基準日（省略時は JST の今日）
     """
-    today = date.today()
+    if today is None:
+        today = datetime.now(JST).date()
 
     start_weekday = WEEK_START_MAP.get(week_start.lower())
     if start_weekday is None:
@@ -249,13 +382,13 @@ def get_week_range(target_week: str, week_start: str) -> tuple[date, date]:
     this_week_start = today - timedelta(days=days_since_start)
 
     if target_week == "previous":
-        week_start_date = this_week_start - timedelta(weeks=1)
-        week_end_date = this_week_start - timedelta(days=1)
+        period_start = this_week_start - timedelta(weeks=1)
+        period_end = this_week_start - timedelta(days=1)
     else:  # current
-        week_start_date = this_week_start
-        week_end_date = today
+        period_start = this_week_start
+        period_end = today
 
-    return week_start_date, week_end_date
+    return period_start, period_end
 
 
 # ==============================================================
@@ -328,10 +461,10 @@ def resolve_filter_params(
         # typeId 1=テキスト, 2=文章, 3=数値, 4=日付 → 単一値（変換不要）
         list_types = {5, 6, 7, 8}
 
-        def resolve_value(v):
+        def resolve_value(v, _items_map=items_map):
             """選択肢名 → 数値ID に変換（items_mapにあれば）"""
-            if isinstance(v, str) and v in items_map:
-                return items_map[v]
+            if isinstance(v, str) and v in _items_map:
+                return _items_map[v]
             return v
 
         if type_id in list_types or len(values) > 1:
@@ -350,8 +483,8 @@ def resolve_filter_params(
 def classify_issue_from_comments(
     issue: dict,
     comments: list,
-    week_start: date,
-    week_end: date,
+    period_start: date,
+    period_end: date,
     closed_status_names: set,
     open_status_names: set,
 ) -> dict:
@@ -360,6 +493,7 @@ def classify_issue_from_comments(
 
     各カテゴリは独立して判定され、現在のステータスに依存しない。
     期間開始時点のステータスはコメント履歴から正確に導出する。
+    日付の比較はすべて JST に変換して行う。
 
     Returns:
         is_carry_over   : ① 期間前作成かつ期間開始時オープン
@@ -368,18 +502,20 @@ def classify_issue_from_comments(
         is_completed    : ④ 期間中にオープン系から完了系へ変化
         status_at_start : 期間開始時点のステータス名
         status_at_end   : 期間終了時点のステータス名
+        seen_statuses   : この課題で観測されたステータス名の集合（設定漏れ検出用）
     """
-    ws = week_start.strftime("%Y-%m-%d")
-    we = week_end.strftime("%Y-%m-%d")
-    created = issue.get("created", "")[:10]
+    ws = period_start.strftime("%Y-%m-%d")
+    we = period_end.strftime("%Y-%m-%d")
+    created = to_local_date(issue.get("created", ""))
 
     # コメントの changeLog からステータス変化を抽出（コメントは昇順で渡される前提）
     changes_before: list = []  # 期間前のステータス変化
     changes_in: list = []      # 期間中のステータス変化
     changes_after: list = []   # 期間後のステータス変化
+    seen_statuses: set = set()
 
     for comment in comments:
-        comment_date = comment.get("created", "")[:10]
+        comment_date = to_local_date(comment.get("created", ""))
         for cl in comment.get("changeLog", []):
             if cl.get("field") != "status":
                 continue
@@ -388,6 +524,7 @@ def classify_issue_from_comments(
                 "from": cl.get("originalValue", ""),
                 "to":   cl.get("newValue", ""),
             }
+            seen_statuses.update(v for v in (entry["from"], entry["to"]) if v)
             if comment_date < ws:
                 changes_before.append(entry)
             elif comment_date <= we:
@@ -408,6 +545,8 @@ def classify_issue_from_comments(
         status_at_start = changes_after[0]["from"]
     else:
         status_at_start = issue.get("status", {}).get("name", "")
+        if status_at_start:
+            seen_statuses.add(status_at_start)
 
     # 期間終了時点のステータスを確定
     # ・期間中に変化あり     → 最後の変化の to が期間終了時ステータス
@@ -446,141 +585,68 @@ def classify_issue_from_comments(
         "is_completed":    completed_during,                          # ④
         "status_at_start": status_at_start,
         "status_at_end":   status_at_end,
+        "seen_statuses":   seen_statuses,
     }
 
 
-def scan_issue_status_changes_from_activities(
+def _with_status(issue: dict, status_name: str) -> dict:
+    """表示ステータスを差し替えた課題のコピーを返す（元の課題は変更しない）"""
+    issue_copy = {**issue}
+    issue_copy["status"] = {**issue_copy.get("status", {}), "name": status_name}
+    return issue_copy
+
+
+def _fetch_comments_bulk(
     client: BacklogClient,
-    project_key: str,
-    week_start: date,
-    week_end: date,
-    closed_status_names: set,
-    open_status_names: set,
-    closed_status_ids: list,
-    open_status_ids: list,
-    status_id_to_name: dict,
-) -> tuple:
+    issues: list,
+    period_start: date,
+    max_workers: int,
+) -> dict:
     """
-    /projects/{key}/activities を1回だけ降順スキャンし、
-    対象期間内のステータス変化（完了・再オープン両方）を同時に検出する。
+    分類に必要な課題のコメントだけを並列取得して {issue_id: comments} を返す。
 
-    Backlog on-premise では old_value/new_value がステータス名ではなく
-    数値ID（文字列）で記録されることがあるため、名前・ID両方で照合する。
-
-    Returns:
-        (completed_ids, prev_status_map, reopened_ids)
-        completed_ids   : 期間内に完了系へ変化した課題の数値IDセット
-        prev_status_map : {issue_id: 完了前のステータス名}
-        reopened_ids    : 期間内に完了系→オープン系へ変化した課題の数値IDセット
+    期間開始より前から更新されていない課題は、期間中も期間後もステータスが
+    変化していないことが確定するため、コメントを取得しない（空リスト扱い）。
+    空リストを classify_issue_from_comments に渡した結果は
+    「開始時＝終了時＝現在のステータス、完了・再オープンなし」となり、
+    実際の履歴から導出した結果と一致する。
     """
-    completed_ids: set = set()
-    prev_status_map: dict = {}
-    reopened_ids: set = set()
+    ws = period_start.strftime("%Y-%m-%d")
 
-    # ステータスIDを文字列に変換して照合用セットを作成（APIがIDを文字列で返す場合に対応）
-    closed_id_strs: set = {str(sid) for sid in closed_status_ids}
-    open_id_strs: set = {str(sid) for sid in open_status_ids}
-
-    def is_closed(val: str) -> bool:
-        return val in closed_status_names or val in closed_id_strs
-
-    def is_open(val: str) -> bool:
-        return val in open_status_names or val in open_id_strs
-
-    def resolve_name(val: str) -> str:
-        """IDまたは名前をステータス名に解決する"""
-        if val in status_id_to_name:
-            return status_id_to_name[val]
-        return val or "処理中"
-
-    params: dict = {
-        "activityTypeId": [2, 3],  # type2=課題更新(cloud), type3=課題更新(on-premise) 両対応
-        "count": 100,
-        "order": "desc",
-    }
+    targets = []
+    for issue in issues:
+        updated = to_local_date(issue.get("updated", "")) or to_local_date(issue.get("created", ""))
+        if updated and updated < ws:
+            continue  # 期間開始以降の更新なし → コメント取得不要
+        targets.append(issue.get("id"))
 
     if client.debug:
-        print(f"  [DEBUG] アクティビティスキャン開始: project={project_key}, "
-              f"period={week_start}〜{week_end}", file=sys.stderr)
-        print(f"  [DEBUG] 完了ステータス名={closed_status_names} ID={closed_id_strs}",
-              file=sys.stderr)
-        print(f"  [DEBUG] オープンステータス名={open_status_names} ID={open_id_strs}",
-              file=sys.stderr)
+        print(f"  [DEBUG] コメント取得対象: {len(targets)}件 / 全{len(issues)}件 "
+              f"（{len(issues) - len(targets)}件はスキップ）", file=sys.stderr)
 
-    while True:
-        activities = client._get(f"/projects/{project_key}/activities", params)
-        if not activities:
-            break
+    comments_map: dict = {}
+    if not targets:
+        return comments_map
 
-        stop = False
-        for act in activities:
-            created_str = act.get("created", "")[:10]
-            try:
-                act_date = datetime.strptime(created_str, "%Y-%m-%d").date()
-            except ValueError:
-                continue
+    workers = max(1, min(max_workers, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(client.get_issue_comments, iid): iid for iid in targets}
+        for future in as_completed(futures):
+            comments_map[futures[future]] = future.result()
 
-            # 対象期間より古ければスキャン終了
-            if act_date < week_start:
-                stop = True
-                break
-
-            # 対象期間内のみ処理
-            if act_date <= week_end:
-                content = act.get("content", {})
-                issue_id = content.get("id")
-                key_id = content.get("key_id", "?")
-                changes = content.get("changes", [])
-
-                if client.debug and changes:
-                    print(f"  [DEBUG] activity {project_key}-{key_id} ({created_str}): "
-                          f"type={act.get('type')} changes={changes}", file=sys.stderr)
-
-                for change in changes:
-                    if change.get("field") != "status" or issue_id is None:
-                        continue
-                    old_val = str(change.get("old_value", ""))
-                    new_val = str(change.get("new_value", ""))
-
-                    # 完了への変化（名前またはIDで判定）
-                    if is_closed(new_val):
-                        completed_ids.add(issue_id)
-                        if issue_id not in prev_status_map:
-                            prev_status_map[issue_id] = resolve_name(old_val)
-                        if client.debug:
-                            print(f"  [DEBUG] → 完了と判定: {project_key}-{key_id} "
-                                  f"(id={issue_id}, {old_val}→{new_val})", file=sys.stderr)
-
-                    # 再オープンへの変化（完了系→オープン系、名前またはIDで判定）
-                    if is_closed(old_val) and is_open(new_val):
-                        reopened_ids.add(issue_id)
-                        if client.debug:
-                            print(f"  [DEBUG] → 再オープンと判定: {project_key}-{key_id} "
-                                  f"(id={issue_id}, {old_val}→{new_val})", file=sys.stderr)
-
-        if stop or len(activities) < 100:
-            break
-
-        min_id = min(act["id"] for act in activities)
-        params["maxId"] = min_id - 1
-        time.sleep(0.3)
-
-    if client.debug:
-        print(f"  [DEBUG] スキャン完了: 完了={len(completed_ids)}件, "
-              f"再オープン={len(reopened_ids)}件", file=sys.stderr)
-
-    return completed_ids, prev_status_map, reopened_ids
+    return comments_map
 
 
 def collect_report_data(
     client: BacklogClient,
     project_key: str,
     project_id: int,
-    week_start: date,
-    week_end: date,
+    period_start: date,
+    period_end: date,
     open_status_ids: list,
     closed_status_ids: list,
-    extra_params: dict = None,
+    extra_params: dict | None = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> dict:
     """
     週次レポートに必要なデータを集計する。
@@ -591,12 +657,11 @@ def collect_report_data(
 
     処理フロー:
       1. 最新属性でフィルターした全対象課題を取得（statusId 不問）
-      2. 各課題のコメントを取得してステータス変化履歴を構築
+      2. 期間中に更新された課題のコメントを並列取得
       3. classify_issue_from_comments で①〜⑤を独立判定
       4. ⑤当週未完了 = (①+②+③) - ④ で計算
     """
-    ws = week_start.strftime("%Y-%m-%d")
-    we = week_end.strftime("%Y-%m-%d")
+    we = period_end.strftime("%Y-%m-%d")
     ep = extra_params or {}
 
     # ステータス名の取得（changeLog の値との照合に使用）
@@ -607,14 +672,17 @@ def collect_report_data(
         if client.debug:
             print(f"  [DEBUG] 完了ステータス名: {closed_status_names}", file=sys.stderr)
             print(f"  [DEBUG] オープンステータス名: {open_status_names}", file=sys.stderr)
-    except Exception as e:
-        if client.debug:
-            print(f"  [DEBUG] ステータス取得失敗: {e}", file=sys.stderr)
+    except BacklogAPIError as e:
+        print(f"  ⚠ ステータス一覧の取得に失敗しました（{project_key}）: 全件が0件として集計されます",
+              file=sys.stderr)
+        print(format_api_error(e), file=sys.stderr)
         closed_status_names = set()
         open_status_names   = set()
 
+    known_status_names = open_status_names | closed_status_names
+
     # ---- 全対象課題を取得（最新属性でフィルター、ステータス不問） ----
-    # createdUntil = week_end で期間終了日以前に作成された課題を対象とする
+    # createdUntil = period_end で期間終了日以前に作成された課題を対象とする
     all_issues = client.get_issues(project_id, {
         **ep,
         "createdUntil": we,
@@ -624,23 +692,30 @@ def collect_report_data(
 
     all_issues_map = {i.get("id"): i for i in all_issues}
 
+    # ---- コメントを並列取得（更新のない課題はスキップ） ----
+    failures_before = set(client.comment_failures)
+    comments_map = _fetch_comments_bulk(client, all_issues, period_start, max_workers)
+
     # ---- 各課題をコメント履歴から独立分類（①〜⑤） ----
     carry_over_issues: list = []
     new_issues:        list = []
     completed_issues:  list = []
     reopened_issues:   list = []
     status_at_end_map: dict = {}  # issue_id -> 期間終了時点のステータス名
+    unknown_statuses:  set  = set()
 
     for issue in all_issues:
         issue_id_val = issue.get("id")
-
-        # コメント取得（ステータス変化履歴を含む）
-        comments = client.get_issue_comments(issue_id_val)
+        comments = comments_map.get(issue_id_val, [])
 
         result = classify_issue_from_comments(
-            issue, comments, week_start, week_end,
+            issue, comments, period_start, period_end,
             closed_status_names, open_status_names,
         )
+
+        # 設定に無いステータス名を収集（①③④の判定から漏れる原因になる）
+        if known_status_names:
+            unknown_statuses |= (result["seen_statuses"] - known_status_names)
 
         if client.debug:
             print(
@@ -651,39 +726,23 @@ def collect_report_data(
                 file=sys.stderr,
             )
 
-        # ① 前週残件
+        # ① 前週残件（完了済みなら表示ステータスを期間開始時点に差し替え）
         if result["is_carry_over"]:
             if result["is_completed"]:
-                # 表示ステータスを期間開始時点のステータスに差し替え
-                issue_copy = {**issue}
-                issue_copy["status"] = {
-                    **issue_copy.get("status", {}),
-                    "name": result["status_at_start"],
-                }
-                carry_over_issues.append(issue_copy)
+                carry_over_issues.append(_with_status(issue, result["status_at_start"]))
             else:
                 carry_over_issues.append(issue)
 
-        # ② 新規発生: 表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
+        # ②③④ は表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
         if result["is_new"]:
-            issue_copy = {**issue}
-            issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
-            new_issues.append(issue_copy)
-
-        # ③ 再オープン: 表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
+            new_issues.append(_with_status(issue, result["status_at_end"]))
         if result["is_reopened"]:
-            issue_copy = {**issue}
-            issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
-            reopened_issues.append(issue_copy)
-
-        # 期間終了時点のステータスを記録（④⑤の表示用）
-        status_at_end_map[issue_id_val] = result["status_at_end"]
-
-        # ④ 当週完了: 表示ステータスを期間終了時点に差し替え
+            reopened_issues.append(_with_status(issue, result["status_at_end"]))
         if result["is_completed"]:
-            issue_copy = {**issue}
-            issue_copy["status"] = {**issue_copy.get("status", {}), "name": result["status_at_end"]}
-            completed_issues.append(issue_copy)
+            completed_issues.append(_with_status(issue, result["status_at_end"]))
+
+        # 期間終了時点のステータスを記録（⑤の表示用）
+        status_at_end_map[issue_id_val] = result["status_at_end"]
 
     # ---- ⑤ 当週未完了 = (① + ② + ③) - ④ ----
     completed_id_set = {i.get("id") for i in completed_issues}
@@ -693,10 +752,13 @@ def collect_report_data(
     for iid in incomplete_ids:
         if iid not in all_issues_map:
             continue
-        issue_copy = {**all_issues_map[iid]}
+        base = all_issues_map[iid]
         if iid in status_at_end_map:
-            issue_copy["status"] = {**issue_copy.get("status", {}), "name": status_at_end_map[iid]}
-        incomplete_issues.append(issue_copy)
+            incomplete_issues.append(_with_status(base, status_at_end_map[iid]))
+        else:
+            incomplete_issues.append({**base})
+
+    new_failures = client.comment_failures - failures_before
 
     return {
         "carry_over": carry_over_issues,
@@ -704,6 +766,8 @@ def collect_report_data(
         "completed":  completed_issues,
         "incomplete": incomplete_issues,
         "reopened":   reopened_issues,
+        "unknown_statuses":  unknown_statuses,
+        "comment_failures":  new_failures,
     }
 
 
@@ -711,7 +775,7 @@ def collect_report_data(
 # Markdownレポート生成
 # ==============================================================
 
-def format_issue_table(issues: list, max_display: int = 30) -> str:
+def format_issue_table(issues: list, max_display: int = TABLE_MAX_DISPLAY) -> str:
     """課題リストをMarkdown表形式にフォーマット"""
     if not issues:
         return "_（該当なし）_\n"
@@ -727,7 +791,8 @@ def format_issue_table(issues: list, max_display: int = 30) -> str:
         assignee = issue.get("assignee")
         assignee_name = assignee.get("name", "-") if assignee else "_未割当_"
         due_raw = issue.get("dueDate")
-        due_date = due_raw[:10] if due_raw else "-"  # "YYYY-MM-DDTHH:mm:ss" → "YYYY-MM-DD"
+        # 期限日は日付のみのフィールドのためタイムゾーン変換しない
+        due_date = due_raw[:10] if due_raw else "-"
         lines.append(f"| {issue_key} | {summary} | {status} | {assignee_name} | {due_date} |")
 
     if len(issues) > max_display:
@@ -741,29 +806,33 @@ def keys_str(issues: list) -> str:
     keys = [i.get("issueKey", "?") for i in issues]
     if not keys:
         return "_（なし）_"
-    return "、".join(keys[:20]) + (f" 他{len(keys) - 20}件" if len(keys) > 20 else "")
+    return "、".join(keys[:KEYS_MAX_DISPLAY]) + (
+        f" 他{len(keys) - KEYS_MAX_DISPLAY}件" if len(keys) > KEYS_MAX_DISPLAY else ""
+    )
 
 
 def generate_markdown_report(
     data: dict,
     project_key: str,
     project_name: str,
-    week_start: date,
-    week_end: date,
+    period_start: date,
+    period_end: date,
     filter_name: str = None,
     filter_description: str = None,
     filter_summary: str = None,
 ) -> str:
     """Markdownレポートを生成"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    ws_str = week_start.strftime("%Y/%m/%d")
-    we_str = week_end.strftime("%Y/%m/%d")
+    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
+    ws_str = period_start.strftime("%Y/%m/%d")
+    we_str = period_end.strftime("%Y/%m/%d")
 
     carry_over = data["carry_over"]
     new_issues = data["new_issues"]
     completed = data["completed"]
     incomplete = data["incomplete"]
     reopened = data.get("reopened", [])
+    unknown_statuses = data.get("unknown_statuses") or set()
+    comment_failures = data.get("comment_failures") or set()
 
     title_suffix = f" — {filter_name}" if filter_name else ""
     lines = [
@@ -800,75 +869,59 @@ def generate_markdown_report(
             f"> ⚠️ **注意**: ①残件（{len(carry_over)}）＋ ②新規（{len(new_issues)}）＋ ③再オープン（{len(reopened)}）"
             f"＝ {lhs} に対し、④完了（{len(completed)}）＋ ⑤未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
             "> 同一課題が複数カテゴリに重複して集計されている可能性があります。",
+        ]
+        if unknown_statuses:
+            lines.append(
+                "> 次のステータスが config.yaml の open_status_ids / closed_status_ids の"
+                f"どちらにも含まれていません: {'、'.join(sorted(unknown_statuses))}"
+            )
+        lines.append("")
+
+    if unknown_statuses and lhs == rhs:
+        lines += [
+            "> ⚠️ **注意**: 次のステータスが config.yaml の open_status_ids / closed_status_ids の"
+            f"どちらにも含まれていません: {'、'.join(sorted(unknown_statuses))}",
+            "> 集計から漏れている課題がある可能性があります。",
+            "",
+        ]
+
+    if comment_failures:
+        lines += [
+            f"> ⚠️ **注意**: {len(comment_failures)} 件の課題でコメント履歴の取得に失敗しました。"
+            "該当課題は「期間中にステータス変化なし」として集計されています。",
+            "",
+        ]
+
+    sections = [
+        ("① 前週残件", carry_over,
+         f"{ws_str} より前に作成され、{ws_str} 時点で未完了の課題", TABLE_MAX_DISPLAY),
+        ("② 新規発生", new_issues,
+         f"{ws_str} 〜 {we_str} に作成された課題", TABLE_MAX_DISPLAY),
+        ("③ 再オープン", reopened,
+         f"{ws_str} 〜 {we_str} に完了状態から再度オープンになった課題", TABLE_MAX_DISPLAY),
+        ("④ 当週完了", completed,
+         f"{ws_str} 〜 {we_str} に完了した課題", TABLE_MAX_DISPLAY),
+        ("⑤ 当週未完了", incomplete,
+         f"{we_str} 時点でオープン（未対応・処理中）の課題", TABLE_MAX_DISPLAY_INCOMPLETE),
+    ]
+    for title, issues, description, max_display in sections:
+        lines += [
+            "---",
+            "",
+            f"## {title}",
+            f"**{len(issues)} 件** — {description}",
+            "",
+            keys_str(issues),
+            "",
+            "<details>",
+            "<summary>詳細一覧を表示</summary>",
+            "",
+            format_issue_table(issues, max_display=max_display),
+            "</details>",
             "",
         ]
 
     lines += [
-        "---",
-        "",
-        "## ① 前週残件",
-        f"**{len(carry_over)} 件** — {week_start.strftime('%Y/%m/%d')} より前に作成され、{week_start.strftime('%Y/%m/%d')} 時点で未完了の課題",
-        "",
-        keys_str(carry_over),
-        "",
-        "<details>",
-        "<summary>詳細一覧を表示</summary>",
-        "",
-        format_issue_table(carry_over),
-        "</details>",
-        "",
-        "---",
-        "",
-        "## ② 新規発生",
-        f"**{len(new_issues)} 件** — {ws_str} 〜 {we_str} に作成された課題",
-        "",
-        keys_str(new_issues),
-        "",
-        "<details>",
-        "<summary>詳細一覧を表示</summary>",
-        "",
-        format_issue_table(new_issues),
-        "</details>",
-        "",
-        "---",
-        "",
-        "## ③ 再オープン",
-        f"**{len(reopened)} 件** — {ws_str} 〜 {we_str} に完了状態から再度オープンになった課題",
-        "",
-        keys_str(reopened),
-        "",
-        "<details>",
-        "<summary>詳細一覧を表示</summary>",
-        "",
-        format_issue_table(reopened),
-        "</details>",
-        "",
-        "---",
-        "",
-        "## ④ 当週完了",
-        f"**{len(completed)} 件** — {ws_str} 〜 {we_str} に完了した課題",
-        "",
-        keys_str(completed),
-        "",
-        "<details>",
-        "<summary>詳細一覧を表示</summary>",
-        "",
-        format_issue_table(completed),
-        "</details>",
-        "",
-        "---",
-        "",
-        "## ⑤ 当週未完了",
-        f"**{len(incomplete)} 件** — {we_str} 時点でオープン（未対応・処理中）の課題",
-        "",
-        keys_str(incomplete),
-        "",
-        "<details>",
-        "<summary>詳細一覧を表示</summary>",
-        "",
-        format_issue_table(incomplete, max_display=50),
-        "</details>",
-        "",
         "---",
         "",
         "_このレポートは backlog_weekly_report.py により自動生成されました。_",
@@ -900,279 +953,6 @@ def safe_filename(name: str) -> str:
     return name
 
 
-# ==============================================================
-# メイン処理
-# ==============================================================
-
-def load_config(config_path: str) -> dict:
-    """設定ファイルを読み込む"""
-    path = Path(config_path)
-    if not path.exists():
-        print(f"エラー: 設定ファイルが見つかりません: {config_path}", file=sys.stderr)
-        sys.exit(1)
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Backlog レポート生成",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-期間指定の優先順位:
-  1. --from / --to  （最優先）
-  2. --week         （前週 or 今週の自動計算）
-  3. config.yaml の target_week 設定
-
-例:
-  python backlog_weekly_report.py --from 2026-03-01 --to 2026-03-31
-  python backlog_weekly_report.py --week current
-  python backlog_weekly_report.py
-""",
-    )
-    default_config = str(Path(__file__).parent / "config.yaml")
-    parser.add_argument("--config", default=default_config,
-                        help=f"設定ファイルのパス（デフォルト: スクリプトと同じディレクトリの config.yaml）")
-    parser.add_argument("--week", choices=["previous", "current"],
-                        help="対象週の指定（設定ファイルの値を上書き）")
-    parser.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD",
-                        help="集計開始日（例: 2026-03-01）。--to と併用。")
-    parser.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
-                        help="集計終了日（例: 2026-03-31）。--from と併用。")
-    parser.add_argument("--debug", action="store_true",
-                        help="APIリクエストのパラメータを表示する（トラブルシューティング用）")
-    args = parser.parse_args()
-
-    # --from / --to の検証
-    if bool(args.date_from) != bool(args.date_to):
-        parser.error("--from と --to は両方セットで指定してください。")
-    if args.date_from and args.week:
-        parser.error("--from/--to と --week は同時に指定できません。")
-
-    # 設定読み込み
-    config = load_config(args.config)
-    backlog_cfg = config.get("backlog", {})
-    report_cfg = config.get("report", {})
-    filters_cfg = config.get("filters") or []
-
-    space_host = backlog_cfg.get("space_host", "")
-    api_key = backlog_cfg.get("api_key", "")
-    project_key = backlog_cfg.get("project_key", "")
-
-    if not space_host or space_host == "yourcompany.backlog.com":
-        print("エラー: config.yaml の space_host を設定してください", file=sys.stderr)
-        sys.exit(1)
-    if not api_key or api_key == "YOUR_API_KEY_HERE":
-        print("エラー: config.yaml の api_key を設定してください", file=sys.stderr)
-        sys.exit(1)
-    if not project_key or project_key == "YOUR_PROJECT_KEY":
-        print("エラー: config.yaml の project_key を設定してください", file=sys.stderr)
-        sys.exit(1)
-
-    output_dir_raw = report_cfg.get("output_dir", "./reports")
-    output_dir = Path(output_dir_raw)
-    if not output_dir.is_absolute():
-        # 相対パスはスクリプトと同じディレクトリ基準で解決（フルパス実行対応）
-        output_dir = Path(__file__).parent / output_dir
-    open_status_ids = report_cfg.get("open_status_ids", [1, 2, 3])
-    closed_status_ids = report_cfg.get("closed_status_ids", [4])
-
-    # 期間の決定: --from/--to > --week > config.period > config.target_week
-    cfg_period = report_cfg.get("period") or {}
-
-    if args.date_from:
-        # 最優先: コマンドライン引数
-        try:
-            week_start = datetime.strptime(args.date_from, "%Y-%m-%d").date()
-            week_end   = datetime.strptime(args.date_to,   "%Y-%m-%d").date()
-        except ValueError:
-            parser.error("日付は YYYY-MM-DD 形式で入力してください（例: 2026-03-01）")
-        if week_start > week_end:
-            parser.error("--from は --to より前の日付を指定してください。")
-        period_label = "指定期間（引数）"
-    elif args.week:
-        # 2番目: --week オプション
-        week_start_day = report_cfg.get("week_start", "monday")
-        week_start, week_end = get_week_range(args.week, week_start_day)
-        period_label = "前週" if args.week == "previous" else "今週"
-    elif cfg_period.get("from") and cfg_period.get("to"):
-        # 3番目: config.yaml の period 設定
-        try:
-            week_start = datetime.strptime(str(cfg_period["from"]), "%Y-%m-%d").date()
-            week_end   = datetime.strptime(str(cfg_period["to"]),   "%Y-%m-%d").date()
-        except ValueError:
-            print("エラー: config.yaml の report.period.from / to は YYYY-MM-DD 形式で記入してください",
-                  file=sys.stderr)
-            sys.exit(1)
-        if week_start > week_end:
-            print("エラー: config.yaml の report.period.from は to より前の日付にしてください",
-                  file=sys.stderr)
-            sys.exit(1)
-        period_label = "指定期間（config）"
-    else:
-        # 最終フォールバック: target_week の自動計算
-        target_week    = report_cfg.get("target_week", "previous")
-        week_start_day = report_cfg.get("week_start", "monday")
-        week_start, week_end = get_week_range(target_week, week_start_day)
-        period_label = "前週" if target_week == "previous" else "今週"
-
-    print("=" * 55)
-    print("Backlog レポート生成")
-    print("=" * 55)
-    print(f"スペース    : {space_host}")
-    print(f"プロジェクト : {project_key}（デフォルト）")
-    print(f"対象期間    : {week_start} 〜 {week_end}（{period_label}）")
-    print(f"フィルター数 : {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
-    print()
-
-    ssl_verify = backlog_cfg.get("ssl_verify", True)
-    base_path  = backlog_cfg.get("base_path", "")
-    client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify, base_path=base_path, debug=args.debug)
-
-    # ---- プロジェクト情報キャッシュ ----
-    # 同一 project_key に対する API 呼び出しを1回に抑える。
-    # 構造: {project_key: {id, name, issue_type_map, custom_field_map, master_loaded}}
-    project_cache: dict = {}
-
-    def get_project_info(pk: str, need_master: bool = False) -> dict:
-        """プロジェクト情報をキャッシュ付きで取得する。"""
-        if pk not in project_cache:
-            print(f"プロジェクト情報を取得中... ({pk})")
-            try:
-                proj = client.get_project(pk)
-            except SystemExit:
-                raise
-            except Exception as e:
-                print(f"エラー: プロジェクト情報の取得に失敗しました ({pk}): {e}", file=sys.stderr)
-                sys.exit(1)
-            project_cache[pk] = {
-                "id":               proj["id"],
-                "name":             proj["name"],
-                "issue_type_map":   {},
-                "custom_field_map": {},
-                "master_loaded":    False,
-            }
-            print(f"プロジェクト名: {project_cache[pk]['name']} (ID: {project_cache[pk]['id']})")
-
-        info = project_cache[pk]
-
-        if need_master and not info["master_loaded"]:
-            print(f"種別・カスタム属性マスターを取得中... ({pk})")
-            try:
-                issue_types = client.get_issue_types(pk)
-                info["issue_type_map"] = {it["name"]: it["id"] for it in issue_types}
-                if args.debug:
-                    print(f"  [DEBUG] 種別マップ（名前→ID）: {info['issue_type_map']}", file=sys.stderr)
-                else:
-                    print(f"  種別: {list(info['issue_type_map'].keys())}")
-            except Exception as e:
-                print(f"  ⚠ 種別マスターの取得に失敗: {e}", file=sys.stderr)
-
-            try:
-                custom_fields = client.get_custom_fields(pk)
-                info["custom_field_map"] = {
-                    cf["name"]: {
-                        "id":     cf["id"],
-                        "typeId": cf.get("typeId"),
-                        # リスト型（typeId 5/6/7/8）の選択肢を {名前: ID} で保持
-                        "items":  {item["name"]: item["id"] for item in cf.get("items", [])},
-                    }
-                    for cf in custom_fields
-                }
-                if args.debug:
-                    for fname, finfo in info["custom_field_map"].items():
-                        print(f"  [DEBUG] カスタム属性「{fname}」: id={finfo['id']}, typeId={finfo['typeId']}, items={finfo['items']}", file=sys.stderr)
-                else:
-                    print(f"  カスタム属性: {list(info['custom_field_map'].keys())}")
-            except Exception as e:
-                print(f"  ⚠ カスタム属性マスターの取得に失敗: {e}", file=sys.stderr)
-
-            info["master_loaded"] = True
-
-        return info
-
-    # デフォルトプロジェクトを先に取得（存在確認 + ヘッダー表示）
-    get_project_info(project_key, need_master=False)
-    print()
-
-    # 期間フォルダを output_dir 配下に作成（例: reports/20260101_20260107/）
-    period_dir = f"{week_start.strftime('%Y%m%d')}_{week_end.strftime('%Y%m%d')}"
-    output_dir = output_dir / period_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ---- フィルターなし（filters が空の場合）----
-    if not filters_cfg:
-        default_info = get_project_info(project_key)
-        print("【フィルターなし】全課題を集計中...")
-        data = collect_report_data(
-            client, project_key, default_info["id"], week_start, week_end,
-            open_status_ids, closed_status_ids
-        )
-        report_md = generate_markdown_report(
-            data, project_key, default_info["name"], week_start, week_end
-        )
-        output_path = output_dir / "weekly_report.md"
-        output_path.write_text(report_md, encoding="utf-8")
-        _print_summary(output_path, data)
-        return
-
-    # ---- フィルターごとに集計・出力 ----
-    all_filter_data = []
-    for i, filter_cfg in enumerate(filters_cfg, 1):
-        filter_name = filter_cfg.get("name") or f"filter_{i}"
-        filter_desc = filter_cfg.get("description") or ""
-
-        # フィルター個別の project_key（未指定ならデフォルトを使用）
-        filter_project_key = filter_cfg.get("project_key") or project_key
-
-        # プロジェクト情報をキャッシュ付きで取得（初回のみ API 呼び出し）
-        proj_info = get_project_info(filter_project_key, need_master=True)
-        filter_project_id   = proj_info["id"]
-        filter_project_name = proj_info["name"]
-        filter_issue_type_map   = proj_info["issue_type_map"]
-        filter_custom_field_map = proj_info["custom_field_map"]
-
-        filter_summary = build_filter_summary(filter_cfg)
-
-        print(f"[{i}/{len(filters_cfg)}] フィルター「{filter_name}」を集計中...")
-        if filter_project_key != project_key:
-            print(f"         プロジェクト: {filter_project_key}")
-        print(f"         条件: {filter_summary}")
-
-        # フィルターパラメータを解決
-        extra_params = resolve_filter_params(filter_cfg, filter_issue_type_map, filter_custom_field_map)
-        if args.debug:
-            print(f"  [DEBUG] 解決済みフィルターパラメータ: {extra_params}", file=sys.stderr)
-
-        data = collect_report_data(
-            client, filter_project_key, filter_project_id, week_start, week_end,
-            open_status_ids, closed_status_ids,
-            extra_params=extra_params,
-        )
-
-        report_md = generate_markdown_report(
-            data, filter_project_key, filter_project_name, week_start, week_end,
-            filter_name=filter_name,
-            filter_description=filter_desc,
-            filter_summary=filter_summary,
-        )
-
-        all_filter_data.append((filter_name, data))
-
-        safe_name = safe_filename(filter_name)
-        output_path = output_dir / f"weekly_report_{safe_name}.md"
-        output_path.write_text(report_md, encoding="utf-8")
-        _print_summary(output_path, data)
-        print()
-
-    # ---- サマリーレポート出力 ----
-    if all_filter_data:
-        summary_md = generate_summary_report(all_filter_data, week_start, week_end)
-        summary_path = output_dir / "summary_report.md"
-        summary_path.write_text(summary_md, encoding="utf-8")
-        print(f"  ✅ サマリー保存: {summary_path}")
-
-
 def _issue_sort_key(issue: dict) -> tuple:
     """課題番号を (プロジェクトキー, 番号) のタプルで返す数値ソート用キー"""
     raw = issue.get("issueKey", "")
@@ -1190,19 +970,19 @@ def _fmt_due(due_raw: str | None) -> str:
     """期限日を m/d 形式に変換（例: '2026-04-07T...' → '4/7'）"""
     if not due_raw:
         return "なし"
-    d = due_raw[:10]  # "YYYY-MM-DD"
+    d = due_raw[:10]  # "YYYY-MM-DD"（日付のみのフィールドのため変換しない）
     m, day = int(d[5:7]), int(d[8:10])
     return f"{m}/{day}"
 
 
 def generate_summary_report(
     all_filter_data: list,
-    week_start,
-    week_end,
+    period_start: date,
+    period_end: date,
 ) -> str:
     """全フィルターをまとめたサマリーレポートを生成"""
     lines = [
-        f"# サマリーレポート — {week_start.strftime('%Y/%m/%d')} 〜 {week_end.strftime('%Y/%m/%d')}",
+        f"# サマリーレポート — {period_start.strftime('%Y/%m/%d')} 〜 {period_end.strftime('%Y/%m/%d')}",
         "",
     ]
 
@@ -1235,6 +1015,196 @@ def generate_summary_report(
     return "\n".join(lines) + "\n"
 
 
+# ==============================================================
+# 設定・引数
+# ==============================================================
+
+def load_config(config_path: str) -> dict:
+    """設定ファイルを読み込む"""
+    path = Path(config_path)
+    if not path.exists():
+        print(f"エラー: 設定ファイルが見つかりません: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """コマンドライン引数パーサーを構築する"""
+    parser = argparse.ArgumentParser(
+        description="Backlog レポート生成",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+期間指定の優先順位:
+  1. --from / --to  （最優先）
+  2. --week         （前週 or 今週の自動計算）
+  3. config.yaml の target_week 設定
+
+例:
+  python backlog_weekly_report.py --from 2026-03-01 --to 2026-03-31
+  python backlog_weekly_report.py --week current
+  python backlog_weekly_report.py
+""",
+    )
+    default_config = str(Path(__file__).parent / "config.yaml")
+    parser.add_argument("--config", default=default_config,
+                        help="設定ファイルのパス（デフォルト: スクリプトと同じディレクトリの config.yaml）")
+    parser.add_argument("--week", choices=["previous", "current"],
+                        help="対象週の指定（設定ファイルの値を上書き）")
+    parser.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD",
+                        help="集計開始日（例: 2026-03-01）。--to と併用。")
+    parser.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
+                        help="集計終了日（例: 2026-03-31）。--from と併用。")
+    parser.add_argument("--debug", action="store_true",
+                        help="APIリクエストのパラメータを表示する（トラブルシューティング用）")
+    return parser
+
+
+def validate_backlog_config(backlog_cfg: dict) -> tuple[str, str, str]:
+    """backlog 設定を検証して (space_host, api_key, project_key) を返す"""
+    placeholders = [
+        ("space_host",  "yourcompany.backlog.com"),
+        ("api_key",     "YOUR_API_KEY_HERE"),
+        ("project_key", "YOUR_PROJECT_KEY"),
+    ]
+    values = []
+    for key, placeholder in placeholders:
+        value = backlog_cfg.get(key, "")
+        if not value or value == placeholder:
+            print(f"エラー: config.yaml の {key} を設定してください", file=sys.stderr)
+            sys.exit(1)
+        values.append(value)
+    return tuple(values)
+
+
+def resolve_period(args, report_cfg: dict, parser: argparse.ArgumentParser) -> tuple[date, date, str]:
+    """
+    集計期間を決定する。
+
+    優先順位: --from/--to > --week > config.report.period > config.report.target_week
+    """
+    cfg_period = report_cfg.get("period") or {}
+
+    if args.date_from:
+        # 最優先: コマンドライン引数
+        try:
+            period_start = datetime.strptime(args.date_from, "%Y-%m-%d").date()
+            period_end   = datetime.strptime(args.date_to,   "%Y-%m-%d").date()
+        except ValueError:
+            parser.error("日付は YYYY-MM-DD 形式で入力してください（例: 2026-03-01）")
+        if period_start > period_end:
+            parser.error("--from は --to より前の日付を指定してください。")
+        return period_start, period_end, "指定期間（引数）"
+
+    if args.week:
+        # 2番目: --week オプション
+        week_start_day = report_cfg.get("week_start", "monday")
+        period_start, period_end = get_week_range(args.week, week_start_day)
+        return period_start, period_end, "前週" if args.week == "previous" else "今週"
+
+    if cfg_period.get("from") and cfg_period.get("to"):
+        # 3番目: config.yaml の period 設定
+        try:
+            period_start = datetime.strptime(str(cfg_period["from"]), "%Y-%m-%d").date()
+            period_end   = datetime.strptime(str(cfg_period["to"]),   "%Y-%m-%d").date()
+        except ValueError:
+            print("エラー: config.yaml の report.period.from / to は YYYY-MM-DD 形式で記入してください",
+                  file=sys.stderr)
+            sys.exit(1)
+        if period_start > period_end:
+            print("エラー: config.yaml の report.period.from は to より前の日付にしてください",
+                  file=sys.stderr)
+            sys.exit(1)
+        return period_start, period_end, "指定期間（config）"
+
+    # 最終フォールバック: target_week の自動計算
+    target_week    = report_cfg.get("target_week", "previous")
+    week_start_day = report_cfg.get("week_start", "monday")
+    period_start, period_end = get_week_range(target_week, week_start_day)
+    return period_start, period_end, "前週" if target_week == "previous" else "今週"
+
+
+# ==============================================================
+# プロジェクト情報キャッシュ
+# ==============================================================
+
+class ProjectInfoCache:
+    """
+    同一 project_key に対する API 呼び出しを1回に抑えるキャッシュ。
+
+    保持する情報: {id, name, issue_type_map, custom_field_map, master_loaded}
+    """
+
+    def __init__(self, client: BacklogClient, debug: bool = False):
+        self.client = client
+        self.debug = debug
+        self._cache: dict = {}
+
+    def get(self, project_key: str, need_master: bool = False) -> dict:
+        """プロジェクト情報をキャッシュ付きで取得する。"""
+        if project_key not in self._cache:
+            print(f"プロジェクト情報を取得中... ({project_key})")
+            try:
+                proj = self.client.get_project(project_key)
+            except BacklogAPIError as e:
+                print(f"エラー: プロジェクト情報の取得に失敗しました ({project_key})", file=sys.stderr)
+                print(format_api_error(e), file=sys.stderr)
+                sys.exit(1)
+            self._cache[project_key] = {
+                "id":               proj["id"],
+                "name":             proj["name"],
+                "issue_type_map":   {},
+                "custom_field_map": {},
+                "master_loaded":    False,
+            }
+            info = self._cache[project_key]
+            print(f"プロジェクト名: {info['name']} (ID: {info['id']})")
+
+        info = self._cache[project_key]
+        if need_master and not info["master_loaded"]:
+            self._load_master(project_key, info)
+        return info
+
+    def _load_master(self, project_key: str, info: dict) -> None:
+        """種別・カスタム属性のマスターを取得して info に格納する"""
+        print(f"種別・カスタム属性マスターを取得中... ({project_key})")
+        try:
+            issue_types = self.client.get_issue_types(project_key)
+            info["issue_type_map"] = {it["name"]: it["id"] for it in issue_types}
+            if self.debug:
+                print(f"  [DEBUG] 種別マップ（名前→ID）: {info['issue_type_map']}", file=sys.stderr)
+            else:
+                print(f"  種別: {list(info['issue_type_map'].keys())}")
+        except BacklogAPIError as e:
+            print(f"  ⚠ 種別マスターの取得に失敗: {e}", file=sys.stderr)
+
+        try:
+            custom_fields = self.client.get_custom_fields(project_key)
+            info["custom_field_map"] = {
+                cf["name"]: {
+                    "id":     cf["id"],
+                    "typeId": cf.get("typeId"),
+                    # リスト型（typeId 5/6/7/8）の選択肢を {名前: ID} で保持
+                    "items":  {item["name"]: item["id"] for item in cf.get("items", [])},
+                }
+                for cf in custom_fields
+            }
+            if self.debug:
+                for fname, finfo in info["custom_field_map"].items():
+                    print(f"  [DEBUG] カスタム属性「{fname}」: id={finfo['id']}, "
+                          f"typeId={finfo['typeId']}, items={finfo['items']}", file=sys.stderr)
+            else:
+                print(f"  カスタム属性: {list(info['custom_field_map'].keys())}")
+        except BacklogAPIError as e:
+            print(f"  ⚠ カスタム属性マスターの取得に失敗: {e}", file=sys.stderr)
+
+        info["master_loaded"] = True
+
+
+# ==============================================================
+# メイン処理
+# ==============================================================
+
 def _print_summary(output_path: Path, data: dict) -> None:
     print(f"  ✅ 保存: {output_path}")
     print(f"     ①前週残件: {len(data['carry_over'])} 件 / "
@@ -1242,6 +1212,144 @@ def _print_summary(output_path: Path, data: dict) -> None:
           f"③再オープン: {len(data['reopened'])} 件 / "
           f"④完了: {len(data['completed'])} 件 / "
           f"⑤未完了: {len(data['incomplete'])} 件")
+    unknown = data.get("unknown_statuses") or set()
+    if unknown:
+        print(f"     ⚠ 設定外のステータス: {'、'.join(sorted(unknown))}"
+              "（open_status_ids / closed_status_ids を確認してください）", file=sys.stderr)
+    failures = data.get("comment_failures") or set()
+    if failures:
+        print(f"     ⚠ コメント履歴の取得に失敗: {len(failures)} 件", file=sys.stderr)
+
+
+def run(argv: list | None = None) -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    # --from / --to の検証
+    if bool(args.date_from) != bool(args.date_to):
+        parser.error("--from と --to は両方セットで指定してください。")
+    if args.date_from and args.week:
+        parser.error("--from/--to と --week は同時に指定できません。")
+
+    # 設定読み込み
+    config = load_config(args.config)
+    backlog_cfg = config.get("backlog", {})
+    report_cfg = config.get("report", {})
+    filters_cfg = config.get("filters") or []
+
+    space_host, api_key, project_key = validate_backlog_config(backlog_cfg)
+
+    output_dir_raw = report_cfg.get("output_dir", "./reports")
+    output_dir = Path(output_dir_raw)
+    if not output_dir.is_absolute():
+        # 相対パスはスクリプトと同じディレクトリ基準で解決（フルパス実行対応）
+        output_dir = Path(__file__).parent / output_dir
+    open_status_ids = report_cfg.get("open_status_ids", DEFAULT_OPEN_STATUS_IDS)
+    closed_status_ids = report_cfg.get("closed_status_ids", DEFAULT_CLOSED_STATUS_IDS)
+    max_workers = int(report_cfg.get("max_workers", DEFAULT_MAX_WORKERS))
+
+    period_start, period_end, period_label = resolve_period(args, report_cfg, parser)
+
+    print("=" * 55)
+    print("Backlog レポート生成")
+    print("=" * 55)
+    print(f"スペース    : {space_host}")
+    print(f"プロジェクト : {project_key}（デフォルト）")
+    print(f"対象期間    : {period_start} 〜 {period_end}（{period_label} / JST基準）")
+    print(f"フィルター数 : {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
+    print()
+
+    ssl_verify = backlog_cfg.get("ssl_verify", True)
+    base_path  = backlog_cfg.get("base_path", "")
+    client = BacklogClient(space_host, api_key, ssl_verify=ssl_verify, base_path=base_path, debug=args.debug)
+    projects = ProjectInfoCache(client, debug=args.debug)
+
+    # デフォルトプロジェクトを先に取得（存在確認 + ヘッダー表示）
+    projects.get(project_key, need_master=False)
+    print()
+
+    # 期間フォルダを output_dir 配下に作成（例: reports/20260101_20260107/）
+    period_dir = f"{period_start.strftime('%Y%m%d')}_{period_end.strftime('%Y%m%d')}"
+    output_dir = output_dir / period_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- フィルターなし（filters が空の場合）----
+    if not filters_cfg:
+        default_info = projects.get(project_key)
+        print("【フィルターなし】全課題を集計中...")
+        data = collect_report_data(
+            client, project_key, default_info["id"], period_start, period_end,
+            open_status_ids, closed_status_ids, max_workers=max_workers,
+        )
+        report_md = generate_markdown_report(
+            data, project_key, default_info["name"], period_start, period_end
+        )
+        output_path = output_dir / "weekly_report.md"
+        output_path.write_text(report_md, encoding="utf-8")
+        _print_summary(output_path, data)
+        return
+
+    # ---- フィルターごとに集計・出力 ----
+    all_filter_data = []
+    for i, filter_cfg in enumerate(filters_cfg, 1):
+        filter_name = filter_cfg.get("name") or f"filter_{i}"
+        filter_desc = filter_cfg.get("description") or ""
+
+        # フィルター個別の project_key（未指定ならデフォルトを使用）
+        filter_project_key = filter_cfg.get("project_key") or project_key
+
+        # プロジェクト情報をキャッシュ付きで取得（初回のみ API 呼び出し）
+        proj_info = projects.get(filter_project_key, need_master=True)
+        filter_summary = build_filter_summary(filter_cfg)
+
+        print(f"[{i}/{len(filters_cfg)}] フィルター「{filter_name}」を集計中...")
+        if filter_project_key != project_key:
+            print(f"         プロジェクト: {filter_project_key}")
+        print(f"         条件: {filter_summary}")
+
+        # フィルターパラメータを解決
+        extra_params = resolve_filter_params(
+            filter_cfg, proj_info["issue_type_map"], proj_info["custom_field_map"]
+        )
+        if args.debug:
+            print(f"  [DEBUG] 解決済みフィルターパラメータ: {extra_params}", file=sys.stderr)
+
+        data = collect_report_data(
+            client, filter_project_key, proj_info["id"], period_start, period_end,
+            open_status_ids, closed_status_ids,
+            extra_params=extra_params,
+            max_workers=max_workers,
+        )
+
+        report_md = generate_markdown_report(
+            data, filter_project_key, proj_info["name"], period_start, period_end,
+            filter_name=filter_name,
+            filter_description=filter_desc,
+            filter_summary=filter_summary,
+        )
+
+        all_filter_data.append((filter_name, data))
+
+        safe_name = safe_filename(filter_name)
+        output_path = output_dir / f"weekly_report_{safe_name}.md"
+        output_path.write_text(report_md, encoding="utf-8")
+        _print_summary(output_path, data)
+        print()
+
+    # ---- サマリーレポート出力 ----
+    if all_filter_data:
+        summary_md = generate_summary_report(all_filter_data, period_start, period_end)
+        summary_path = output_dir / "summary_report.md"
+        summary_path.write_text(summary_md, encoding="utf-8")
+        print(f"  ✅ サマリー保存: {summary_path}")
+
+
+def main():
+    try:
+        run()
+    except BacklogAPIError as e:
+        print(format_api_error(e), file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
