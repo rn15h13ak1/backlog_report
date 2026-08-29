@@ -7,6 +7,7 @@ run() を通しで動かすテスト。
 
 出力先は一時ディレクトリに向けるため、リポジトリ配下には何も生成しない。
 """
+import json
 from pathlib import Path
 
 import pytest
@@ -430,3 +431,62 @@ def test_run_resolves_relative_output_dir_against_script(tmp_path, stub, monkeyp
     bwr.run(["--config", str(config)])
 
     assert (tmp_path / "out" / PERIOD_DIR / "weekly_report.md").exists()
+
+
+# ==================================================================
+# 次回照合用のスナップショット
+# ==================================================================
+
+def read_snapshot(out: Path) -> dict:
+    return json.loads((out / PERIOD_DIR / bwr.SNAPSHOT_FILENAME).read_text(encoding="utf-8"))
+
+
+def test_snapshot_written_without_filters(tmp_path, stub):
+    """フィルターなしでもスナップショットを残すこと"""
+    stub()
+    out = tmp_path / "out"
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    snap = read_snapshot(out)
+    assert snap["version"] == bwr.SNAPSHOT_VERSION
+    assert snap["period"] == {"from": "2026-03-02", "to": "2026-03-08"}
+    assert [f["name"] for f in snap["filters"]] == [bwr.NO_FILTER_NAME]
+    keys = sorted(i["issueKey"] for i in snap["filters"][0]["incomplete"])
+    assert keys == ["PRJ-1", "PRJ-3"]
+
+
+def test_snapshot_records_each_filter_with_its_condition(tmp_path, stub):
+    """フィルターごとに⑤の課題と絞り込み条件を残すこと"""
+    stub()
+    out = tmp_path / "out"
+    bwr.run(["--config", str(write_config(tmp_path, out, filters=FILTERS))])
+
+    snap = read_snapshot(out)
+    assert [f["name"] for f in snap["filters"]] == ["バグ対応", "A/チーム"]
+    assert snap["filters"][0]["condition"] == "種別: バグ"
+    assert snap["filters"][1]["condition"] == "対応チーム: Aチーム"
+
+
+def test_snapshot_entry_holds_display_fields(tmp_path, stub):
+    """次回そのまま表示できるだけの情報を持つこと（再取得を不要にする）"""
+    stub()
+    out = tmp_path / "out"
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    entry = next(i for i in read_snapshot(out)["filters"][0]["incomplete"]
+                 if i["issueKey"] == "PRJ-1")
+    assert entry == {
+        "id": 1, "issueKey": "PRJ-1", "summary": "残件1",
+        "status": "処理中", "dueDate": "2026-03-10T00:00:00Z", "assignee": None,
+    }
+
+
+def test_snapshot_is_valid_json_utf8(tmp_path, stub):
+    """日本語がエスケープされずそのまま読めること"""
+    stub()
+    out = tmp_path / "out"
+    bwr.run(["--config", str(write_config(tmp_path, out, filters=FILTERS))])
+
+    raw = (out / PERIOD_DIR / bwr.SNAPSHOT_FILENAME).read_text(encoding="utf-8")
+    assert "バグ対応" in raw
+    assert raw.endswith("\n")

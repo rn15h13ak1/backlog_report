@@ -687,6 +687,53 @@ def _fetch_comments_bulk(
     return comments_map
 
 
+SNAPSHOT_FILENAME = "snapshot.json"
+NO_FILTER_NAME = "__no_filter__"   # フィルター無しで集計したときの記録上の名前
+SNAPSHOT_VERSION = 1
+
+
+def _snapshot_entry(issue: dict) -> dict:
+    """スナップショットに残す最小限の課題情報（次回の表示に使う）"""
+    return {
+        "id":       issue.get("id"),
+        "issueKey": issue.get("issueKey"),
+        "summary":  issue.get("summary"),
+        "status":   issue.get("status", {}).get("name"),
+        "dueDate":  issue.get("dueDate"),
+        "assignee": (issue.get("assignee") or {}).get("name"),
+    }
+
+
+def build_snapshot(period_start: date, period_end: date, entries: list) -> dict:
+    """
+    次回実行時に「抽出対象から外れた課題」を検知するための記録。
+
+    entries: [(フィルター名, 絞り込み条件の文字列, 集計結果)] のリスト。
+    ⑤の課題だけを残す。次回の①と突き合わせて差分を取るために使う。
+    """
+    return {
+        "version": SNAPSHOT_VERSION,
+        "period": {
+            "from": period_start.isoformat(),
+            "to":   period_end.isoformat(),
+        },
+        "filters": [
+            {
+                "name": name,
+                "condition": condition,
+                "incomplete": [_snapshot_entry(i) for i in data["incomplete"]],
+            }
+            for name, condition, data in entries
+        ],
+    }
+
+
+def write_snapshot(output_dir: Path, snapshot: dict) -> Path:
+    path = output_dir / SNAPSHOT_FILENAME
+    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def validate_status_config(statuses: list, closed_status_ids: list, project_key: str) -> None:
     """
     closed_status_ids の妥当性を検証する。
@@ -1430,10 +1477,14 @@ def run(argv: list | None = None) -> None:
         output_path = output_dir / "weekly_report.md"
         output_path.write_text(report_md, encoding="utf-8")
         _print_summary(output_path, data)
+        write_snapshot(output_dir, build_snapshot(
+            period_start, period_end, [(NO_FILTER_NAME, "", data)]
+        ))
         return
 
     # ---- フィルターごとに集計・出力 ----
     all_filter_data = []
+    snapshot_entries: list = []
     for i, filter_cfg in enumerate(filters_cfg, 1):
         filter_name = filter_cfg.get("name") or f"filter_{i}"
         filter_desc = filter_cfg.get("description") or ""
@@ -1472,6 +1523,7 @@ def run(argv: list | None = None) -> None:
         )
 
         all_filter_data.append((filter_name, data))
+        snapshot_entries.append((filter_name, filter_summary, data))
 
         safe_name = safe_filename(filter_name)
         output_path = output_dir / f"weekly_report_{safe_name}.md"
@@ -1485,6 +1537,12 @@ def run(argv: list | None = None) -> None:
         summary_path = output_dir / "summary_report.md"
         summary_path.write_text(summary_md, encoding="utf-8")
         print(f"  ✅ サマリー保存: {summary_path}")
+
+    if snapshot_entries:
+        snapshot_path = write_snapshot(output_dir, build_snapshot(
+            period_start, period_end, snapshot_entries
+        ))
+        print(f"  ✅ 次回照合用の記録: {snapshot_path}")
 
 
 def main():
