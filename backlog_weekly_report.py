@@ -643,6 +643,59 @@ def _fetch_comments_bulk(
     return comments_map
 
 
+def _fetch_target_issues(
+    client: BacklogClient,
+    project_id: int,
+    period_start: date,
+    period_end: date,
+    extra_params: dict,
+    statuses: list,
+    closed_status_ids: list,
+) -> list:
+    """
+    集計に寄与しうる課題だけを取得する。
+
+    「現在のステータスが完了系」かつ「期間開始以降まったく更新されていない」課題は、
+    期間中も期間後もステータスが動いていないため、①〜⑤のいずれにも入らない。
+    よって次の和集合だけを取得すれば足りる。
+
+      A. 現在のステータスが完了系ではない課題（オープン系＋設定外のステータス）
+      B. 期間開始以降に更新された課題
+
+    A に設定外のステータスも含めるのは、集計漏れの警告（unknown_statuses）を
+    従来どおり出せるようにするため。
+
+    ステータス一覧が取得できなかった場合は絞り込みを諦めて全件取得する。
+    """
+    we = period_end.strftime("%Y-%m-%d")
+    base = {**extra_params, "createdUntil": we}
+
+    if not statuses:
+        return client.get_issues(project_id, base)
+
+    non_closed_ids = [s["id"] for s in statuses if s["id"] not in closed_status_ids]
+    if not non_closed_ids:
+        # 全ステータスが完了系という設定。B だけで足りる。
+        non_closed_ids = None
+
+    # updatedSince はサーバー側のタイムゾーンで解釈されるため、
+    # 取りこぼさないよう1日ぶん余裕を持たせる（多めに取っても集計結果は変わらない）。
+    since = (period_start - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    merged: dict = {}
+    if non_closed_ids:
+        for issue in client.get_issues(project_id, {**base, "statusId": non_closed_ids}):
+            merged[issue.get("id")] = issue
+    for issue in client.get_issues(project_id, {**base, "updatedSince": since}):
+        merged[issue.get("id")] = issue
+
+    if client.debug:
+        print(f"  [DEBUG] 対象課題の絞り込み: 未完了系={non_closed_ids} / "
+              f"updatedSince={since} → {len(merged)}件", file=sys.stderr)
+
+    return list(merged.values())
+
+
 def collect_report_data(
     client: BacklogClient,
     project_key: str,
@@ -662,15 +715,15 @@ def collect_report_data(
     フィルター項目（extra_params）は最新の課題属性を使用する。
 
     処理フロー:
-      1. 最新属性でフィルターした全対象課題を取得（statusId 不問）
+      1. 集計に寄与しうる課題だけを取得（_fetch_target_issues 参照）
       2. 期間中に更新された課題のコメントを並列取得
       3. classify_issue_from_comments で①〜⑤を独立判定
       4. ⑤当週未完了 = (①+②+③) - ④ で計算
     """
-    we = period_end.strftime("%Y-%m-%d")
     ep = extra_params or {}
 
     # ステータス名の取得（changeLog の値との照合に使用）
+    statuses: list = []
     try:
         statuses = client.get_statuses(project_key)
         closed_status_names = {s["name"] for s in statuses if s["id"] in closed_status_ids}
@@ -687,12 +740,10 @@ def collect_report_data(
 
     known_status_names = open_status_names | closed_status_names
 
-    # ---- 全対象課題を取得（最新属性でフィルター、ステータス不問） ----
-    # createdUntil = period_end で期間終了日以前に作成された課題を対象とする
-    all_issues = client.get_issues(project_id, {
-        **ep,
-        "createdUntil": we,
-    })
+    # ---- 集計対象の課題を取得 ----
+    all_issues = _fetch_target_issues(
+        client, project_id, period_start, period_end, ep, statuses, closed_status_ids
+    )
     if client.debug:
         print(f"  [DEBUG] 全対象課題数: {len(all_issues)}件", file=sys.stderr)
 

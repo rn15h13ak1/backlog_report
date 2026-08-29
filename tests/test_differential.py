@@ -220,23 +220,54 @@ def test_no_divergence_when_timezone_conversion_is_a_noop():
 
 
 # ==================================================================
-# 2. 集計全体: コメント取得スキップ最適化が結果を変えないこと
+# 2. 集計全体: 取得の絞り込みが結果を変えないこと
 # ==================================================================
 
-class RecordingClient(bwr.BacklogClient):
-    """合成データを返し、コメント取得回数を記録する疑似クライアント"""
+STATUS_ID_BY_NAME = {s["name"]: s["id"] for s in STATUSES}
+STATUS_ID_BY_NAME["レビュー中"] = 5   # config のどちらにも属さないステータスのテスト用
 
-    def __init__(self, issues: list, comments_by_id: dict):
+
+class RecordingClient(bwr.BacklogClient):
+    """
+    合成データを返す疑似クライアント。
+
+    get_issues は Backlog API と同じように statusId / updatedSince /
+    createdUntil を実際に適用する。これにより、新実装が投げる絞り込み
+    クエリと旧実装が投げる全件クエリの結果を突き合わせられる。
+    """
+
+    def __init__(self, issues: list, comments_by_id: dict, statuses: list | None = None):
         super().__init__("example.test", "key")
         self.issues = issues
         self.comments_by_id = comments_by_id
+        self.statuses = STATUSES if statuses is None else statuses
         self.fetch_count = 0
+        self.issued_queries: list = []
 
     def get_statuses(self, project_id_or_key):
-        return STATUSES
+        return self.statuses
 
     def get_issues(self, project_id, params=None):
-        return self.issues
+        params = params or {}
+        self.issued_queries.append(params)
+
+        status_ids = params.get("statusId")
+        updated_since = params.get("updatedSince")
+        created_until = params.get("createdUntil")
+
+        result = []
+        for issue in self.issues:
+            if status_ids is not None:
+                if STATUS_ID_BY_NAME[issue["status"]["name"]] not in status_ids:
+                    continue
+            if updated_since is not None:
+                if bwr.to_local_date(issue["updated"]) < updated_since:
+                    continue
+            if created_until is not None:
+                if bwr.to_local_date(issue["created"]) > created_until:
+                    continue
+            result.append(issue)
+        return result
 
     def get_issue_comments(self, issue_id):
         self.fetch_count += 1
@@ -304,8 +335,114 @@ def test_optimization_actually_skips_fetches():
     issues, comments_by_id = build_corpus("02")
     _, new_client = run_new(issues, comments_by_id)
     _, old_client = run_old(issues, comments_by_id)
-    assert old_client.fetch_count == len(issues)
     assert new_client.fetch_count < old_client.fetch_count
+
+
+# ------------------------------------------------------------------
+# 課題取得の絞り込み
+# ------------------------------------------------------------------
+
+def test_narrowed_fetch_returns_fewer_issues_than_full_fetch():
+    """絞り込みによって取得件数が実際に減っていること"""
+    issues, comments_by_id = build_corpus("02")
+    new_client = RecordingClient(issues, comments_by_id)
+    old_client = RecordingClient(issues, comments_by_id)
+
+    narrowed = bwr._fetch_target_issues(
+        new_client, 1, PERIOD_START, PERIOD_END, {}, STATUSES,
+        bwr.DEFAULT_CLOSED_STATUS_IDS,
+    )
+    full = old_client.get_issues(1, {"createdUntil": PERIOD_END.strftime("%Y-%m-%d")})
+
+    assert len(narrowed) < len(full)
+    # 絞り込みは2クエリ、全件は1クエリ
+    assert len(new_client.issued_queries) == 2
+    assert "statusId" in new_client.issued_queries[0]
+    assert "updatedSince" in new_client.issued_queries[1]
+
+
+def test_excluded_issues_are_only_stale_and_closed():
+    """取得から外れた課題が「現在完了系」かつ「期間開始以降 更新なし」だけであること"""
+    issues, comments_by_id = build_corpus("02")
+    client = RecordingClient(issues, comments_by_id)
+    narrowed_ids = {
+        i["id"] for i in bwr._fetch_target_issues(
+            client, 1, PERIOD_START, PERIOD_END, {}, STATUSES,
+            bwr.DEFAULT_CLOSED_STATUS_IDS,
+        )
+    }
+    ws = PERIOD_START.strftime("%Y-%m-%d")
+    created_until = PERIOD_END.strftime("%Y-%m-%d")
+
+    excluded = [i for i in issues
+                if i["id"] not in narrowed_ids
+                and bwr.to_local_date(i["created"]) <= created_until]
+    assert excluded, "除外された課題が1件も無い（テストデータが不十分）"
+    for issue in excluded:
+        assert issue["status"]["name"] in CLOSED_NAMES
+        assert bwr.to_local_date(issue["updated"]) < ws
+
+
+def test_issues_with_unlisted_status_are_still_fetched():
+    """
+    config のどちらにも属さないステータスの課題は、更新が古くても取得すること。
+    集計漏れの警告を従来どおり出せるようにするため。
+    """
+    stale_unknown = {
+        "id": 1, "issueKey": "PRJ-1",
+        "created": "2024-01-01T02:00:00Z",
+        "updated": "2024-01-01T02:00:00Z",       # 期間よりずっと前
+        "status": {"name": "レビュー中"},          # config の open/closed どちらにも無い
+        "summary": "設定外ステータス", "assignee": None, "dueDate": None,
+    }
+    statuses = STATUSES + [{"id": 5, "name": "レビュー中"}]
+    client = RecordingClient([stale_unknown], {}, statuses=statuses)
+    fetched = bwr._fetch_target_issues(
+        client, 1, PERIOD_START, PERIOD_END, {}, statuses, bwr.DEFAULT_CLOSED_STATUS_IDS,
+    )
+    assert [i["id"] for i in fetched] == [1]
+
+    data = bwr.collect_report_data(
+        client, "PRJ", 1, PERIOD_START, PERIOD_END,
+        bwr.DEFAULT_OPEN_STATUS_IDS, bwr.DEFAULT_CLOSED_STATUS_IDS, max_workers=2,
+    )
+    assert data["unknown_statuses"] == {"レビュー中"}
+
+
+def test_falls_back_to_full_fetch_without_statuses():
+    """ステータス一覧が取れなければ絞り込みを諦めて全件取得すること"""
+    issues, comments_by_id = build_corpus("02")
+    client = RecordingClient(issues, comments_by_id)
+    fetched = bwr._fetch_target_issues(
+        client, 1, PERIOD_START, PERIOD_END, {}, [], bwr.DEFAULT_CLOSED_STATUS_IDS,
+    )
+    assert len(client.issued_queries) == 1
+    assert "statusId" not in client.issued_queries[0]
+    assert "updatedSince" not in client.issued_queries[0]
+    assert len(fetched) == len(client.get_issues(1, client.issued_queries[0]))
+
+
+def test_filter_params_apply_to_both_queries():
+    """フィルター条件は絞り込みの2つのクエリ両方に適用されること"""
+    client = RecordingClient([], {})
+    bwr._fetch_target_issues(
+        client, 1, PERIOD_START, PERIOD_END,
+        {"issueTypeId": [7], "keyword": "障害"}, STATUSES, bwr.DEFAULT_CLOSED_STATUS_IDS,
+    )
+    assert len(client.issued_queries) == 2
+    for query in client.issued_queries:
+        assert query["issueTypeId"] == [7]
+        assert query["keyword"] == "障害"
+        assert query["createdUntil"] == PERIOD_END.strftime("%Y-%m-%d")
+
+
+def test_updated_since_has_one_day_margin():
+    """updatedSince はタイムゾーン差で取りこぼさないよう1日前を指定すること"""
+    client = RecordingClient([], {})
+    bwr._fetch_target_issues(
+        client, 1, PERIOD_START, PERIOD_END, {}, STATUSES, bwr.DEFAULT_CLOSED_STATUS_IDS,
+    )
+    assert client.issued_queries[1]["updatedSince"] == "2026-03-01"   # 開始日は 03-02
 
 
 def test_equation_holds_across_corpus():
