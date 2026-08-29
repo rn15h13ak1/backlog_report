@@ -644,3 +644,83 @@ def test_single_candidate_produces_no_warning(tmp_path, stub, capsys):
     bwr.run(["--config", str(write_config(tmp_path, out))])
 
     assert "終了日が同じ期間フォルダが複数あります" not in capsys.readouterr().err
+
+
+# ==================================================================
+# スナップショットが使えない場合
+# ==================================================================
+
+def test_newly_added_filter_is_reported_as_missing(tmp_path, stub):
+    """
+    config にフィルターを増やした場合、そのフィルターだけ出入りを判定しないこと。
+
+    既存のフィルターは前回の記録があるので通常どおり判定される。
+    フィルターの追加は運用中に必ず起きるため、挙動を固定しておく。
+    """
+    out = tmp_path / "out"
+    # 前回は「バグ対応」しか無かった
+    (out / PREV_DIR).mkdir(parents=True)
+    (out / PREV_DIR / bwr.SNAPSHOT_FILENAME).write_text(json.dumps({
+        "version": bwr.SNAPSHOT_VERSION,
+        "period": {"from": "2026-02-23", "to": "2026-03-01"},
+        "filters": [{"name": "バグ対応", "condition": "種別: バグ",
+                     "incomplete": [bwr._snapshot_entry(i) for i in DEFAULT_ISSUES]}],
+    }, ensure_ascii=False), encoding="utf-8")
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out, filters=FILTERS))])
+
+    added = (out / PERIOD_DIR / "weekly_report_A_チーム.md").read_text(encoding="utf-8")
+    assert "フィルター「A/チーム」は前回の集計に含まれていません" in added
+    assert "抽出対象への出入りを判定していない" in added
+
+    existing = (out / PERIOD_DIR / "weekly_report_バグ対応.md").read_text(encoding="utf-8")
+    assert "前回の集計に含まれていません" not in existing
+
+
+def test_period_folder_without_snapshot_is_reported(tmp_path, stub):
+    """直前の期間のフォルダはあるが snapshot.json が無い場合（失敗した実行の残骸など）"""
+    out = tmp_path / "out"
+    (out / PREV_DIR).mkdir(parents=True)
+    (out / PREV_DIR / "weekly_report.md").write_text("途中で失敗した実行", encoding="utf-8")
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert f"（{PREV_DIR}）に {bwr.SNAPSHOT_FILENAME} がありません" in text
+    assert "| ① 前週残件数 | **2** 件 |" in text     # 集計は従来どおり続く
+
+
+def test_snapshot_with_unknown_version_is_ignored(tmp_path, stub):
+    """形式のバージョンが違うスナップショットは使わないこと"""
+    out = tmp_path / "out"
+    (out / PREV_DIR).mkdir(parents=True)
+    (out / PREV_DIR / bwr.SNAPSHOT_FILENAME).write_text(json.dumps({
+        "version": bwr.SNAPSHOT_VERSION + 1,
+        "period": {"from": "2026-02-23", "to": "2026-03-01"},
+        "filters": [],
+    }), encoding="utf-8")
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "形式が古いため使用しません" in text
+
+
+def test_snapshot_lookup_skips_non_matching_filters(tmp_path):
+    """複数フィルターの記録から、名前が一致するものだけを取り出すこと"""
+    snapshot = {
+        "version": bwr.SNAPSHOT_VERSION,
+        "period": {"from": "2026-02-23", "to": "2026-03-01"},
+        "filters": [
+            {"name": "先に並んでいる別のフィルター", "condition": "種別: タスク",
+             "incomplete": [{"id": 1, "issueKey": "PRJ-1"}]},
+            {"name": "目的のフィルター", "condition": "種別: バグ",
+             "incomplete": [{"id": 2, "issueKey": "PRJ-2"}]},
+        ],
+    }
+    found, reason = bwr.previous_incomplete(snapshot, "目的のフィルター", "種別: バグ")
+    assert reason == ""
+    assert list(found) == [2]      # 先頭の別フィルターは読み飛ばされる
