@@ -601,3 +601,46 @@ def test_broken_snapshot_is_ignored(tmp_path, stub):
     text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
     assert "読み込めませんでした" in text
     assert "| ① 前週残件数 | **2** 件 |" in text   # 現行どおり集計は続く
+
+
+def _write_snapshot_at(out: Path, folder: str, period: dict, issues: list) -> None:
+    (out / folder).mkdir(parents=True, exist_ok=True)
+    (out / folder / bwr.SNAPSHOT_FILENAME).write_text(json.dumps({
+        "version": bwr.SNAPSHOT_VERSION,
+        "period": period,
+        "filters": [{"name": bwr.NO_FILTER_NAME, "condition": "",
+                     "incomplete": [bwr._snapshot_entry(i) for i in issues]}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+def test_picks_latest_start_when_end_dates_collide(tmp_path, stub, capsys):
+    """
+    終了日が同じフォルダが複数ある場合、開始日が最も遅いものを使うこと。
+
+    フォルダの列挙順はファイルシステム依存なので、決め方を固定しておかないと
+    実行のたびに結果が変わりうる。
+    """
+    out = tmp_path / "out"
+    gone = issue(99, "処理中", "2026-01-05T02:00:00Z", "2026-02-20T02:00:00Z", "採用されるべき")
+    other = issue(98, "処理中", "2026-01-05T02:00:00Z", "2026-02-20T02:00:00Z", "採用されないべき")
+    # どちらも 3/1 終わり。開始日が遅いのは 2/23 のほう
+    _write_snapshot_at(out, "20260220_20260301", {"from": "2026-02-20", "to": "2026-03-01"}, [other])
+    _write_snapshot_at(out, "20260223_20260301", {"from": "2026-02-23", "to": "2026-03-01"}, [gone])
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "PRJ-99" in text          # 開始日が遅いほうの⑤が流出として反映される
+    assert "PRJ-98" not in text
+    assert "終了日が同じ期間フォルダが複数あります" in capsys.readouterr().err
+
+
+def test_single_candidate_produces_no_warning(tmp_path, stub, capsys):
+    out = tmp_path / "out"
+    _write_snapshot_at(out, PREV_DIR, {"from": "2026-02-23", "to": "2026-03-01"}, DEFAULT_ISSUES)
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    assert "終了日が同じ期間フォルダが複数あります" not in capsys.readouterr().err

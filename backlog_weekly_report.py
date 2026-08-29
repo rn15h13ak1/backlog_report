@@ -748,24 +748,34 @@ def find_previous_snapshot(output_dir: Path, period_start: date) -> tuple[dict |
         return None, "出力先ディレクトリがまだありません"
 
     wanted_end = (period_start - timedelta(days=1)).strftime("%Y%m%d")
-    for child in output_dir.iterdir():
-        if not child.is_dir() or "_" not in child.name:
-            continue
-        if child.name.rsplit("_", 1)[-1] != wanted_end:
-            continue
-        path = child / SNAPSHOT_FILENAME
-        if not path.exists():
-            return None, f"直前の期間のフォルダ（{child.name}）に {SNAPSHOT_FILENAME} がありません"
-        try:
-            snapshot = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            return None, f"{path} を読み込めませんでした: {e}"
-        if snapshot.get("version") != SNAPSHOT_VERSION:
-            return None, f"{path} の形式が古いため使用しません"
-        return snapshot, ""
+    candidates = [
+        child for child in output_dir.iterdir()
+        if child.is_dir() and "_" in child.name and child.name.rsplit("_", 1)[-1] == wanted_end
+    ]
+    if not candidates:
+        return None, (f"直前の期間（〜{(period_start - timedelta(days=1)).strftime('%Y/%m/%d')}）"
+                      "の集計結果が見つかりません")
 
-    return None, (f"直前の期間（〜{(period_start - timedelta(days=1)).strftime('%Y/%m/%d')}）"
-                  "の集計結果が見つかりません")
+    # 終了日が同じフォルダが複数ありうる（例: 3/1〜3/8 と 3/2〜3/8 の両方で実行した場合）。
+    # フォルダの列挙順はファイルシステム依存で不定なので、開始日が最も遅いもの
+    # （＝期間が最も短い＝直近の集計）を選ぶ。
+    candidates.sort(key=lambda c: c.name.rsplit("_", 1)[0], reverse=True)
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        others = "、".join(c.name for c in candidates[1:])
+        print(f"  ⚠ 終了日が同じ期間フォルダが複数あります。{chosen.name} を使用します"
+              f"（他: {others}）", file=sys.stderr)
+
+    path = chosen / SNAPSHOT_FILENAME
+    if not path.exists():
+        return None, f"直前の期間のフォルダ（{chosen.name}）に {SNAPSHOT_FILENAME} がありません"
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"{path} を読み込めませんでした: {e}"
+    if snapshot.get("version") != SNAPSHOT_VERSION:
+        return None, f"{path} の形式が古いため使用しません"
+    return snapshot, ""
 
 
 def previous_incomplete(snapshot: dict | None, filter_name: str,
