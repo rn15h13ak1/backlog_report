@@ -199,3 +199,54 @@ def test_seen_statuses_collects_unknown_names():
     )
     assert "レビュー中" in result["seen_statuses"]
     assert result["seen_statuses"] - (OPEN | CLOSED) == {"レビュー中"}
+
+
+# ------------------------------------------------------------------
+# to_local_date の高速パス（文字列判定）が strptime 経由と一致すること
+# ------------------------------------------------------------------
+
+def _via_strptime(iso: str) -> str:
+    """比較用の素直な実装"""
+    from datetime import datetime, timezone
+
+    from backlog_weekly_report import JST
+    if not iso:
+        return ""
+    try:
+        dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return iso[:10]
+    return dt.astimezone(JST).date().isoformat()
+
+
+@pytest.mark.parametrize("day", [
+    "2024-02-28", "2024-02-29",   # うるう年
+    "2025-02-28",                 # 平年の2月末
+    "2026-03-31", "2026-04-30",   # 月末
+    "2026-12-31",                 # 年末
+    "2026-01-01",
+])
+@pytest.mark.parametrize("hour", ["00", "09", "14", "15", "16", "23"])
+def test_fast_path_matches_strptime(day, hour):
+    iso = f"{day}T{hour}:30:00Z"
+    assert to_local_date(iso) == _via_strptime(iso)
+
+
+@pytest.mark.parametrize("iso", [
+    "",
+    "2026-03-01",                    # 日付のみ
+    "not-a-date",
+    "2026-03-01T00:00:00+09:00",     # オフセット付き
+    "2026-13-01T00:00:00Z",          # 月が不正（桁は合っている）
+    "2026-02-30T20:00:00Z",          # 存在しない日付
+])
+def test_unexpected_formats_match_strptime(iso):
+    assert to_local_date(iso) == _via_strptime(iso)
+
+
+def test_month_and_year_rollover():
+    """月末・年末をまたぐ繰り上がりが正しいこと"""
+    assert to_local_date("2026-03-31T15:00:00Z") == "2026-04-01"
+    assert to_local_date("2026-12-31T23:59:59Z") == "2027-01-01"
+    assert to_local_date("2024-02-28T15:00:00Z") == "2024-02-29"   # うるう年
+    assert to_local_date("2025-02-28T15:00:00Z") == "2025-03-01"   # 平年
