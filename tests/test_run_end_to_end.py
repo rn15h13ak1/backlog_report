@@ -142,7 +142,9 @@ def test_run_without_filters_writes_one_report(tmp_path, stub, capsys):
     assert "| ② 新規発生件数 | **1** 件 |" in text     # PRJ-3
     assert "| ④ 当週完了件数 | **1** 件 |" in text     # PRJ-2
     assert "| ⑤ 当週未完了件数 | **2** 件 |" in text   # PRJ-1, PRJ-3
-    assert "⚠️" not in text                            # 等式が成立している
+    assert "一致しません" not in text                   # 等式は成立している
+    # 前回の集計が無いので、出入りを判定していない旨の注記が出る
+    assert "抽出対象への出入りを判定していない" in text
 
     stdout = capsys.readouterr().out
     assert "Backlog レポート生成" in stdout
@@ -490,3 +492,112 @@ def test_snapshot_is_valid_json_utf8(tmp_path, stub):
     raw = (out / PERIOD_DIR / bwr.SNAPSHOT_FILENAME).read_text(encoding="utf-8")
     assert "バグ対応" in raw
     assert raw.endswith("\n")
+
+
+# ==================================================================
+# 抽出対象への出入り（流入・流出）
+# ==================================================================
+
+PREV_DIR = "20260223_20260301"      # 直前の期間（2/23〜3/1）
+
+
+def write_prev_snapshot(out: Path, filters: list) -> None:
+    """直前の期間のスナップショットを用意する。filters: [(名前, 条件, [課題])]"""
+    (out / PREV_DIR).mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        "version": bwr.SNAPSHOT_VERSION,
+        "period": {"from": "2026-02-23", "to": "2026-03-01"},
+        "filters": [
+            {"name": name, "condition": cond,
+             "incomplete": [bwr._snapshot_entry(i) for i in issues]}
+            for name, cond, issues in filters
+        ],
+    }
+    (out / PREV_DIR / bwr.SNAPSHOT_FILENAME).write_text(
+        json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+
+
+def test_outflow_is_counted_as_completed(tmp_path, stub, capsys):
+    """前回⑤に居たのに今回の母集団から消えた課題は ④ に入ること"""
+    gone = issue(99, "処理中", "2026-01-05T02:00:00Z", "2026-02-20T02:00:00Z", "対象から外れた")
+    out = tmp_path / "out"
+    write_prev_snapshot(out, [(bwr.NO_FILTER_NAME, "", DEFAULT_ISSUES + [gone])])
+    stub()   # 今回の母集団に PRJ-99 は含まれない
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "| ① 前週残件数 | **3** 件 |" in text     # PRJ-1, PRJ-2 に PRJ-99 が加わる
+    assert "| ④ 当週完了件数 | **2** 件 |" in text   # PRJ-2 に PRJ-99 が加わる
+    assert "| ⑤ 当週未完了件数 | **2** 件 |" in text  # PRJ-99 は⑤に残らない
+    assert "期間中に対象から外れた **1** 件は ④ 当週完了に含めています" in text
+    assert "PRJ-99" in text
+    assert "対象から外れた99" in text                 # 再取得せず前回の情報で表示できる
+    assert "流出 1 件 → ④" in capsys.readouterr().out
+
+
+def test_inflow_is_counted_as_new(tmp_path, stub):
+    """前回⑤に居なかったのに今回①に該当する課題は ② に移ること"""
+    out = tmp_path / "out"
+    # 前回⑤には PRJ-1 だけ。PRJ-2 は期間中に対象へ入ったとみなされる
+    write_prev_snapshot(out, [(bwr.NO_FILTER_NAME, "", [DEFAULT_ISSUES[0]])])
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "| ① 前週残件数 | **1** 件 |" in text     # PRJ-1 のみ
+    assert "| ② 新規発生件数 | **2** 件 |" in text   # PRJ-3 に PRJ-2 が加わる
+    assert "期間中に対象へ入った **1** 件は ② 新規発生に含めています" in text
+
+
+def test_equation_holds_with_flows(tmp_path, stub):
+    """流入・流出を反映しても ①+②+③ = ④+⑤ が成立すること"""
+    gone = issue(99, "処理中", "2026-01-05T02:00:00Z", "2026-02-20T02:00:00Z", "対象外へ")
+    out = tmp_path / "out"
+    write_prev_snapshot(out, [(bwr.NO_FILTER_NAME, "", [DEFAULT_ISSUES[0], gone])])
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "一致しません" not in text
+
+
+def test_previous_period_must_be_adjacent(tmp_path, stub):
+    """直前の期間でないフォルダのスナップショットは使わないこと"""
+    out = tmp_path / "out"
+    (out / "20260101_20260107").mkdir(parents=True)
+    (out / "20260101_20260107" / bwr.SNAPSHOT_FILENAME).write_text("{}", encoding="utf-8")
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "抽出対象への出入りを判定していない" in text
+
+
+def test_changed_filter_condition_disables_flow_detection(tmp_path, stub, capsys):
+    """絞り込み条件が前回と違う場合は出入りを判定しないこと"""
+    out = tmp_path / "out"
+    write_prev_snapshot(out, [("バグ対応", "種別: 別のなにか", DEFAULT_ISSUES)])
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out, filters=[FILTERS[0]]))])
+
+    text = (out / PERIOD_DIR / "weekly_report_バグ対応.md").read_text(encoding="utf-8")
+    assert "絞り込み条件が前回と異なる" in text
+
+
+def test_broken_snapshot_is_ignored(tmp_path, stub):
+    """壊れたスナップショットがあっても処理を止めないこと"""
+    out = tmp_path / "out"
+    (out / PREV_DIR).mkdir(parents=True)
+    (out / PREV_DIR / bwr.SNAPSHOT_FILENAME).write_text("{ こわれている", encoding="utf-8")
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "読み込めませんでした" in text
+    assert "| ① 前週残件数 | **2** 件 |" in text   # 現行どおり集計は続く

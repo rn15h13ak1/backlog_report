@@ -734,6 +734,117 @@ def write_snapshot(output_dir: Path, snapshot: dict) -> Path:
     return path
 
 
+def find_previous_snapshot(output_dir: Path, period_start: date) -> tuple[dict | None, str]:
+    """
+    直前の期間のスナップショットを探す。
+
+    期間フォルダ名は YYYYMMDD_YYYYMMDD 形式なので、終了日が period_start の前日に
+    あたるフォルダを探す。期間の長さは問わないため、週次でも任意期間でも動く。
+
+    Returns:
+        (スナップショット, 見つからなかった理由) — 見つかれば理由は空文字
+    """
+    if not output_dir.exists():
+        return None, "出力先ディレクトリがまだありません"
+
+    wanted_end = (period_start - timedelta(days=1)).strftime("%Y%m%d")
+    for child in output_dir.iterdir():
+        if not child.is_dir() or "_" not in child.name:
+            continue
+        if child.name.rsplit("_", 1)[-1] != wanted_end:
+            continue
+        path = child / SNAPSHOT_FILENAME
+        if not path.exists():
+            return None, f"直前の期間のフォルダ（{child.name}）に {SNAPSHOT_FILENAME} がありません"
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            return None, f"{path} を読み込めませんでした: {e}"
+        if snapshot.get("version") != SNAPSHOT_VERSION:
+            return None, f"{path} の形式が古いため使用しません"
+        return snapshot, ""
+
+    return None, (f"直前の期間（〜{(period_start - timedelta(days=1)).strftime('%Y/%m/%d')}）"
+                  "の集計結果が見つかりません")
+
+
+def previous_incomplete(snapshot: dict | None, filter_name: str,
+                        condition: str) -> tuple[dict | None, str]:
+    """
+    スナップショットから、指定フィルターの前回⑤を取り出す。
+
+    Returns:
+        ({課題ID: 課題情報}, 使えない理由) — 使えれば理由は空文字
+    """
+    if snapshot is None:
+        return None, ""
+    for entry in snapshot.get("filters", []):
+        if entry.get("name") != filter_name:
+            continue
+        if entry.get("condition", "") != condition:
+            return None, (f"フィルター「{filter_name}」の絞り込み条件が前回と異なるため"
+                          "（前回: " + (entry.get("condition") or "（なし）") + "）、"
+                          "抽出対象への出入りは判定しません")
+        return {i["id"]: i for i in entry.get("incomplete", [])}, ""
+    return None, f"フィルター「{filter_name}」は前回の集計に含まれていません"
+
+
+def apply_population_flows(data: dict, prev_incomplete: dict) -> dict:
+    """
+    前回⑤と突き合わせて、抽出対象への出入りを集計に反映する。
+
+    流入（前回⑤に無いのに今回①に居る）: 期首の在庫ではないので ① → ②
+    流出（前回⑤に居たのに今回の母集団に居ない）: 期首は在庫、期中に対象外へ → ① かつ ④
+
+    属性そのものは見ず、集合の差分だけで判定するため、種別でもカスタム属性でも
+    キーワードでも同じように動く。
+    """
+    prev_ids = set(prev_incomplete)
+    present_ids = {i.get("id") for i in data["all_issues"]}
+
+    carry_over = list(data["carry_over"])
+    new_issues = list(data["new_issues"])
+    completed  = list(data["completed"])
+
+    inflow = [i for i in carry_over if i.get("id") not in prev_ids]
+    if inflow:
+        inflow_ids = {i.get("id") for i in inflow}
+        carry_over = [i for i in carry_over if i.get("id") not in inflow_ids]
+        new_issues = new_issues + inflow
+
+    outflow_ids = prev_ids - present_ids
+    outflow = []
+    for issue_id in sorted(outflow_ids):
+        saved = prev_incomplete[issue_id]
+        outflow.append({
+            "id":       saved.get("id"),
+            "issueKey": saved.get("issueKey"),
+            "summary":  saved.get("summary"),
+            "status":   {"name": saved.get("status") or "-"},
+            "dueDate":  saved.get("dueDate"),
+            "assignee": {"name": saved["assignee"]} if saved.get("assignee") else None,
+        })
+    if outflow:
+        # 期間開始時点では在庫だったので①に含め、期中に対象外になったので④にも含める
+        carry_over = carry_over + outflow
+        completed  = completed + outflow
+
+    active_ids = {i.get("id") for i in carry_over + new_issues + data["reopened"]}
+    completed_ids = {i.get("id") for i in completed}
+    by_id = {i.get("id"): i for i in carry_over + new_issues + data["reopened"] + data["incomplete"]}
+    incomplete = [by_id[i] for i in sorted(active_ids - completed_ids) if i in by_id]
+
+    return {
+        **data,
+        "carry_over": carry_over,
+        "new_issues": new_issues,
+        "completed":  completed,
+        "incomplete": incomplete,
+        "inflow":     inflow,
+        "outflow":    outflow,
+    }
+
+
 def validate_status_config(statuses: list, closed_status_ids: list, project_key: str) -> None:
     """
     closed_status_ids の妥当性を検証する。
@@ -938,6 +1049,10 @@ def collect_report_data(
         "reopened":   reopened_issues,
         "unknown_statuses":  unknown_statuses,
         "comment_failures":  new_failures,
+        # 抽出対象への出入りの判定に使う（母集団に居るかどうか）
+        "all_issues": all_issues,
+        "inflow":  [],
+        "outflow": [],
     }
 
 
@@ -1003,6 +1118,9 @@ def generate_markdown_report(
     reopened = data.get("reopened", [])
     unknown_statuses = data.get("unknown_statuses") or set()
     comment_failures = data.get("comment_failures") or set()
+    inflow = data.get("inflow") or []
+    outflow = data.get("outflow") or []
+    flow_unavailable = data.get("flow_unavailable") or ""
 
     title_suffix = f" — {filter_name}" if filter_name else ""
     lines = [
@@ -1058,6 +1176,23 @@ def generate_markdown_report(
         lines += [
             f"> ⚠️ **注意**: {len(comment_failures)} 件の課題でコメント履歴の取得に失敗しました。"
             "該当課題は「期間中にステータス変化なし」として集計されています。",
+            "",
+        ]
+
+    if inflow or outflow:
+        lines.append("> 抽出対象への出入りを前回の集計と突き合わせて反映しています。")
+        if inflow:
+            lines.append(f"> 期間中に対象へ入った **{len(inflow)}** 件は ② 新規発生に含めています: "
+                         f"{keys_str(inflow)}")
+        if outflow:
+            lines.append(f"> 期間中に対象から外れた **{len(outflow)}** 件は ④ 当週完了に含めています: "
+                         f"{keys_str(outflow)}")
+        lines.append("")
+
+    if flow_unavailable:
+        lines += [
+            f"> ⚠️ **注意**: {flow_unavailable}。",
+            "> 抽出対象への出入りを判定していないため、① と ② の内訳が実態と異なる場合があります。",
             "",
         ]
 
@@ -1396,6 +1531,22 @@ class ProjectInfoCache:
 # メイン処理
 # ==============================================================
 
+def _apply_flows(data: dict, snapshot: dict | None, filter_name: str,
+                 condition: str, snapshot_reason: str) -> dict:
+    """前回⑤と突き合わせて抽出対象への出入りを反映する（できない場合はそのまま返す）"""
+    prev, reason = previous_incomplete(snapshot, filter_name, condition)
+    if prev is None:
+        note = reason or snapshot_reason
+        if note:
+            data = {**data, "flow_unavailable": note}
+        return data
+    result = apply_population_flows(data, prev)
+    if result["inflow"] or result["outflow"]:
+        print(f"         抽出対象への出入り: 流入 {len(result['inflow'])} 件 → ② / "
+              f"流出 {len(result['outflow'])} 件 → ④")
+    return result
+
+
 def _print_summary(output_path: Path, data: dict) -> None:
     print(f"  ✅ 保存: {output_path}")
     print(f"     ①前週残件: {len(data['carry_over'])} 件 / "
@@ -1439,6 +1590,7 @@ def run(argv: list | None = None) -> None:
     max_workers = resolve_max_workers(report_cfg)
 
     period_start, period_end, period_label = resolve_period(args, report_cfg, parser)
+    prev_snapshot, snapshot_reason = find_previous_snapshot(output_dir, period_start)
 
     print("=" * 55)
     print("Backlog レポート生成")
@@ -1447,6 +1599,11 @@ def run(argv: list | None = None) -> None:
     print(f"プロジェクト : {project_key}（デフォルト）")
     print(f"対象期間    : {period_start} 〜 {period_end}（{period_label} / JST基準）")
     print(f"フィルター数 : {len(filters_cfg) if filters_cfg else 0}（0=フィルターなし）")
+    if prev_snapshot:
+        prev = prev_snapshot["period"]
+        print(f"前回の集計   : {prev['from']} 〜 {prev['to']}（抽出対象への出入りを判定します）")
+    else:
+        print(f"前回の集計   : なし（{snapshot_reason}）")
     print()
 
     ssl_verify = backlog_cfg.get("ssl_verify", True)
@@ -1471,6 +1628,7 @@ def run(argv: list | None = None) -> None:
             client, project_key, default_info["id"], period_start, period_end,
             closed_status_ids, max_workers=max_workers,
         )
+        data = _apply_flows(data, prev_snapshot, NO_FILTER_NAME, "", snapshot_reason)
         report_md = generate_markdown_report(
             data, project_key, default_info["name"], period_start, period_end
         )
@@ -1514,6 +1672,7 @@ def run(argv: list | None = None) -> None:
             extra_params=extra_params,
             max_workers=max_workers,
         )
+        data = _apply_flows(data, prev_snapshot, filter_name, filter_summary, snapshot_reason)
 
         report_md = generate_markdown_report(
             data, filter_project_key, proj_info["name"], period_start, period_end,
