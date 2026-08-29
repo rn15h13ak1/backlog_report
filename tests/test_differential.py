@@ -351,9 +351,10 @@ def assert_equivalent_except_completion_rule(new_data, old_data, moved):
     """
     ①②③の顔ぶれは完全一致し、④⑤の差は④の定義変更ぶんだけであること。
 
-    ①の表示ステータスは比較しない。①は「④にも入る場合のみ期間開始時点、
-    それ以外は現在の値」という実装のため、④の判定が変わると表示も連動して変わる。
-    表示内容そのものは tests/test_report_format.py のゴールデン比較で担保している。
+    表示ステータスは比較しない。旧実装の①は「④にも入る場合のみ期間開始時点、
+    それ以外は現在の値」だったが、新実装は常に期間開始時点を表示するようになったため。
+    表示内容は tests/test_report_format.py のゴールデン比較と
+    tests/test_weekly_chain.py で担保している。
     """
     new_c, old_c = categorize(new_data), categorize(old_data)
     for key in ("carry_over", "new_issues", "reopened"):
