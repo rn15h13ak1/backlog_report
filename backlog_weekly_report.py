@@ -155,6 +155,8 @@ class BacklogClient:
         # 実行中のコメントキャッシュ（フィルター間で課題が重複しても取得は1回）
         self._comment_cache: dict[int, list] = {}
         self._comment_lock = threading.Lock()
+        # ステータス一覧のキャッシュ（同一プロジェクトのフィルターが複数あっても取得は1回）
+        self._status_cache: dict[str | int, list] = {}
         # コメント取得に失敗した課題ID（集計後に警告表示する）
         self.comment_failures: set[int] = set()
 
@@ -259,8 +261,12 @@ class BacklogClient:
         return self._get(f"/projects/{project_id_or_key}/customFields")
 
     def get_statuses(self, project_id_or_key: str | int) -> list:
-        """プロジェクトのステータス一覧を取得"""
-        return self._get(f"/projects/{project_id_or_key}/statuses")
+        """プロジェクトのステータス一覧を取得（実行中はキャッシュする）"""
+        if project_id_or_key not in self._status_cache:
+            self._status_cache[project_id_or_key] = self._get(
+                f"/projects/{project_id_or_key}/statuses"
+            )
+        return self._status_cache[project_id_or_key]
 
     def get_issues(self, project_id: int, params: dict | None = None) -> list:
         """

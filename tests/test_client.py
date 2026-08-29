@@ -230,3 +230,20 @@ def test_bulk_fetch_falls_back_to_fetching_when_updated_missing(client, monkeypa
     issues = [{"id": 1}]
     result = bwr._fetch_comments_bulk(client, issues, date(2026, 3, 2), max_workers=2)
     assert set(result) == {1}
+
+
+def test_statuses_are_cached(client, monkeypatch, no_sleep):
+    """同一プロジェクトのステータス一覧は1回しか取得しないこと"""
+    calls = patch_urlopen(monkeypatch, lambda _a: FakeResponse([{"id": 1, "name": "未対応"}]))
+    first = client.get_statuses("PRJ")
+    second = client.get_statuses("PRJ")
+    assert first == second
+    assert len(calls) == 1
+
+
+def test_statuses_cached_per_project(client, monkeypatch, no_sleep):
+    """プロジェクトが違えば別々に取得すること"""
+    calls = patch_urlopen(monkeypatch, lambda _a: FakeResponse([{"id": 1, "name": "未対応"}]))
+    client.get_statuses("PRJ")
+    client.get_statuses("OTHER")
+    assert len(calls) == 2
