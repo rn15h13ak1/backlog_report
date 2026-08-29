@@ -555,14 +555,18 @@ def test_skip_optimization_precondition():
         "changeLog": [{"field": "status", "originalValue": "未対応", "newValue": "処理中"}],
     }]
 
+    def keys_only(data):
+        # 表示ステータスは①の仕様変更で新旧が異なるため、顔ぶれだけで比較する
+        return {k: sorted(key for key, _ in v) for k, v in categorize(data).items()}
+
     new_data, new_client = run_new([issue], {1: comments})
     old_data, _ = run_old([issue], {1: comments})
 
     assert new_client.fetch_count == 0                      # スキップされる
-    assert categorize(new_data) != categorize(old_data)     # よって食い違う
+    assert keys_only(new_data) != keys_only(old_data)       # よって食い違う
 
     # updated を正しく（最終変化以降に）すれば一致する
     fixed = {**issue, "updated": "2026-03-05T02:00:00Z"}
     fixed_data, fixed_client = run_new([fixed], {1: comments})
     assert fixed_client.fetch_count == 1
-    assert categorize(fixed_data) == categorize(old_data)
+    assert keys_only(fixed_data) == keys_only(old_data)

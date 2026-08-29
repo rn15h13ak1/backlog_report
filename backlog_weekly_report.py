@@ -1007,12 +1007,11 @@ def collect_report_data(
                 file=sys.stderr,
             )
 
-        # ① 前週残件（完了済みなら表示ステータスを期間開始時点に差し替え）
+        # ① 前週残件: 表示ステータスを常に期間開始時点に差し替える。
+        # 差し替えないと、期間より後に変化した課題が現在のステータスで表示され、
+        # 同じ課題が①と⑤で違うステータスに見えてしまう。
         if result["is_carry_over"]:
-            if result["is_completed"]:
-                carry_over_issues.append(_with_status(issue, result["status_at_start"]))
-            else:
-                carry_over_issues.append(issue)
+            carry_over_issues.append(_with_status(issue, result["status_at_start"]))
 
         # ②③④ は表示ステータスを期間終了時点に差し替え（現在のステータス混入を防ぐ）
         if result["is_new"]:
