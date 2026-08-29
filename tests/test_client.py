@@ -247,3 +247,52 @@ def test_statuses_cached_per_project(client, monkeypatch, no_sleep):
     client.get_statuses("PRJ")
     client.get_statuses("OTHER")
     assert len(calls) == 2
+
+
+# ------------------------------------------------------------------
+# リトライ待機のばらつき（ジッター）
+# ------------------------------------------------------------------
+
+def record_sleeps(monkeypatch):
+    """time.sleep に渡された秒数を記録する"""
+    slept = []
+    monkeypatch.setattr(bwr.time, "sleep", slept.append)
+    return slept
+
+
+def test_delay_is_never_shorter_than_exponential_backoff(client, monkeypatch):
+    """ジッターは上乗せのみ。指数バックオフの値を下回らないこと"""
+    slept = record_sleeps(monkeypatch)
+    for attempt in range(3):
+        client._sleep_before_retry(attempt, None)
+    for attempt, delay in enumerate(slept):
+        base = 2 ** attempt
+        assert base <= delay <= base * 1.5
+
+
+def test_delay_never_below_retry_after(client, monkeypatch):
+    """Retry-After はサーバーの指示なので、それより短く待たないこと"""
+    slept = record_sleeps(monkeypatch)
+    client._sleep_before_retry(0, "30")
+    assert 30 <= slept[0] <= 45
+
+
+def test_retry_after_is_capped(client, monkeypatch):
+    """極端な Retry-After でも上限で頭打ちになること"""
+    slept = record_sleeps(monkeypatch)
+    client._sleep_before_retry(0, "99999")
+    assert slept[0] == bwr.RETRY_MAX_DELAY
+
+
+def test_invalid_retry_after_falls_back_to_backoff(client, monkeypatch):
+    slept = record_sleeps(monkeypatch)
+    client._sleep_before_retry(2, "しばらく")
+    assert 4 <= slept[0] <= 6
+
+
+def test_delays_actually_vary(client, monkeypatch):
+    """同じ条件でも待ち時間がばらつくこと（揃っていれば衝突が繰り返される）"""
+    slept = record_sleeps(monkeypatch)
+    for _ in range(50):
+        client._sleep_before_retry(2, None)
+    assert len(set(slept)) > 1

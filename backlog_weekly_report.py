@@ -34,6 +34,7 @@ config.yaml の filters に複数のフィルターを定義すると、
 
 import argparse
 import json
+import random
 import ssl
 import sys
 import threading
@@ -69,6 +70,7 @@ API_TIMEOUT = 30       # 1リクエストのタイムアウト（秒）
 API_MAX_RETRIES = 3    # 一時的な失敗に対する最大リトライ回数
 API_PAGE_SIZE = 100    # Backlog API の1回あたり最大取得件数
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+RETRY_MAX_DELAY = 60.0  # リトライ1回あたりの最大待機秒数
 
 # レポート表示上限
 TABLE_MAX_DISPLAY = 30
@@ -223,13 +225,21 @@ class BacklogClient:
         return BacklogAPIError(endpoint, status_code=e.code, detail=detail, raw_body=raw_body)
 
     def _sleep_before_retry(self, attempt: int, retry_after: str | None) -> None:
-        """指数バックオフ（Retry-After ヘッダがあれば優先）"""
-        delay = 2 ** attempt  # 1, 2, 4 秒
+        """
+        指数バックオフ（Retry-After ヘッダがあれば優先）。
+
+        並列でコメントを取得しているため、複数のワーカーが同時にレート制限に
+        掛かると全員が同じ秒数だけ待って同時に再送し、また衝突する。
+        これを避けるため待ち時間にばらつきを加える。
+        サーバーの指示を下回らないよう、上乗せのみで短くはしない。
+        """
+        base = 2 ** attempt  # 1, 2, 4 秒
         if retry_after:
             try:
-                delay = max(delay, min(float(retry_after), 60.0))
+                base = max(base, min(float(retry_after), 60.0))
             except ValueError:
                 pass
+        delay = min(base + random.uniform(0, base / 2), RETRY_MAX_DELAY)
         if self.debug:
             print(f"  [DEBUG] {delay:.1f}秒待機してリトライします（{attempt + 1}/{API_MAX_RETRIES}）",
                   file=sys.stderr)
