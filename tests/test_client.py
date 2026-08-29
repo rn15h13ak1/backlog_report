@@ -296,3 +296,62 @@ def test_delays_actually_vary(client, monkeypatch):
     for _ in range(50):
         client._sleep_before_retry(2, None)
     assert len(set(slept)) > 1
+
+
+# ------------------------------------------------------------------
+# エラーメッセージの組み立て
+# ------------------------------------------------------------------
+
+@pytest.mark.parametrize("code,expected", [
+    (400, "リクエストパラメータを確認してください"),
+    (401, "api_key を確認してください"),
+    (403, "api_key の権限を確認してください"),
+    (404, "space_host または project_key を確認してください"),
+    (429, "リトライ"),
+    (503, "リトライ"),
+])
+def test_format_api_error_gives_status_specific_advice(code, expected):
+    err = BacklogAPIError("/issues", status_code=code, detail="なにか")
+    message = bwr.format_api_error(err)
+    assert f"HTTP {code}" in message
+    assert "詳細: なにか" in message
+    assert expected in message
+
+
+def test_format_api_error_falls_back_to_raw_body():
+    """詳細が取れない場合はレスポンス本文を出すこと"""
+    err = BacklogAPIError("/issues", status_code=500, raw_body="x" * 900)
+    message = bwr.format_api_error(err)
+    assert "レスポンス: " + "x" * 500 in message
+    assert "x" * 501 not in message      # 500文字で打ち切る
+
+
+def test_format_api_error_for_connection_failure():
+    """接続できなかった場合は HTTP ステータスではなく接続の確認を促すこと"""
+    err = BacklogAPIError("/space", status_code=None, detail="Name or service not known")
+    message = bwr.format_api_error(err)
+    assert "API へ接続できませんでした: /space" in message
+    assert "詳細: Name or service not known" in message
+    assert "space_host / base_path / ネットワーク接続" in message
+
+
+def test_ssl_verify_false_disables_certificate_check():
+    import ssl as ssl_module
+    client = BacklogClient("h", "k", ssl_verify=False)
+    assert client.ssl_context is not None
+    assert client.ssl_context.check_hostname is False
+    assert client.ssl_context.verify_mode == ssl_module.CERT_NONE
+
+
+def test_get_issue_comments_paginates_with_min_id(client, monkeypatch, no_sleep):
+    """100件ちょうど返ったら minId を進めて次ページを取りに行くこと"""
+    page1 = [{"id": i, "created": "2026-03-04T02:00:00Z", "changeLog": []}
+             for i in range(1, bwr.API_PAGE_SIZE + 1)]
+    page2 = [{"id": 500, "created": "2026-03-05T02:00:00Z", "changeLog": []}]
+    urls = patch_urlopen(monkeypatch, lambda a: FakeResponse(page1 if a == 0 else page2))
+
+    comments = client.get_issue_comments(42)
+
+    assert len(comments) == bwr.API_PAGE_SIZE + 1
+    assert len(urls) == 2
+    assert f"minId={bwr.API_PAGE_SIZE + 1}" in urls[1]   # 最大ID+1 から続きを取る

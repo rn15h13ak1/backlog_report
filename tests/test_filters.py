@@ -91,3 +91,10 @@ def test_build_filter_summary():
 
 def test_build_filter_summary_empty():
     assert build_filter_summary({}) == "（なし）"
+
+
+def test_custom_field_without_name_or_id_is_skipped(capsys):
+    """field_name も field_id も無い指定は警告して読み飛ばすこと"""
+    cfg = {"custom_fields": [{"values": ["X"]}, {"field_name": "備考", "values": ["メモ"]}]}
+    assert resolve_filter_params(cfg, {}, CUSTOM_FIELDS) == {"customField_600": "メモ"}
+    assert "field_name または field_id が必要です" in capsys.readouterr().err
