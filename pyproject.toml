@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "backlog-weekly-report"
 version = "0.1.0"
@@ -13,6 +17,11 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.4",
 ]
+
+# パッケージではなく単一モジュールの構成のため、対象を明示する。
+# 指定しないと setuptools がトップレベルのモジュールを2つ見つけて自動判別を中止する。
+[tool.setuptools]
+py-modules = ["backlog_weekly_report", "check_api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
