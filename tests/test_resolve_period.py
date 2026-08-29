@@ -175,3 +175,32 @@ def test_parser_rejects_from_without_to():
 def test_parser_rejects_unknown_week_value():
     with pytest.raises(SystemExit):
         bwr.build_arg_parser().parse_args(["--week", "nextweek"])
+
+
+# ==================================================================
+# 並列数の決定
+# ==================================================================
+
+@pytest.mark.parametrize("configured,expected", [
+    (None, bwr.DEFAULT_MAX_WORKERS),   # 未設定
+    (1, 1),
+    (4, 4),
+    (8, 8),
+    (50, bwr.MAX_WORKERS_LIMIT),       # 上限で頭打ち
+    (0, 1),                            # 下限で底打ち
+    (-3, 1),
+    ("6", 6),                          # YAML が文字列で読んだ場合
+])
+def test_resolve_max_workers(configured, expected):
+    cfg = {} if configured is None else {"max_workers": configured}
+    assert bwr.resolve_max_workers(cfg) == expected
+
+
+@pytest.mark.parametrize("bad", ["たくさん", None, [4]])
+def test_resolve_max_workers_falls_back_on_invalid(bad):
+    """数値として解釈できない値は既定値に戻す"""
+    assert bwr.resolve_max_workers({"max_workers": bad}) == bwr.DEFAULT_MAX_WORKERS
+
+
+def test_max_workers_limit_is_reasonable():
+    assert 1 <= bwr.DEFAULT_MAX_WORKERS <= bwr.MAX_WORKERS_LIMIT

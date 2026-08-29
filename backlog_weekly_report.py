@@ -62,6 +62,8 @@ DEFAULT_CLOSED_STATUS_IDS = [3, 4]
 
 # コメント取得の並列度の既定値
 DEFAULT_MAX_WORKERS = 4
+# 設定ミスで API を叩きすぎないための上限。Backlog のレート制限に配慮する。
+MAX_WORKERS_LIMIT = 8
 
 API_TIMEOUT = 30       # 1リクエストのタイムアウト（秒）
 API_MAX_RETRIES = 3    # 一時的な失敗に対する最大リトライ回数
@@ -1155,6 +1157,28 @@ def validate_backlog_config(backlog_cfg: dict) -> tuple[str, str, str]:
     return tuple(values)
 
 
+def resolve_max_workers(report_cfg: dict) -> int:
+    """
+    コメント取得の並列数を決める。
+
+    設定ミスで API を叩きすぎないよう 1〜MAX_WORKERS_LIMIT に収める。
+    数値として解釈できない値は既定値に戻す。
+    """
+    raw = report_cfg.get("max_workers", DEFAULT_MAX_WORKERS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        print(f"  ⚠ max_workers に数値以外が指定されています（{raw!r}）。"
+              f"既定値 {DEFAULT_MAX_WORKERS} を使用します。", file=sys.stderr)
+        return DEFAULT_MAX_WORKERS
+
+    clamped = max(1, min(value, MAX_WORKERS_LIMIT))
+    if clamped != value:
+        print(f"  ⚠ max_workers は 1〜{MAX_WORKERS_LIMIT} の範囲で指定してください"
+              f"（{value} → {clamped} に調整しました）。", file=sys.stderr)
+    return clamped
+
+
 def resolve_period(args, report_cfg: dict, parser: argparse.ArgumentParser) -> tuple[date, date, str]:
     """
     集計期間を決定する。
@@ -1324,7 +1348,7 @@ def run(argv: list | None = None) -> None:
         output_dir = Path(__file__).parent / output_dir
     open_status_ids = report_cfg.get("open_status_ids", DEFAULT_OPEN_STATUS_IDS)
     closed_status_ids = report_cfg.get("closed_status_ids", DEFAULT_CLOSED_STATUS_IDS)
-    max_workers = int(report_cfg.get("max_workers", DEFAULT_MAX_WORKERS))
+    max_workers = resolve_max_workers(report_cfg)
 
     period_start, period_end, period_label = resolve_period(args, report_cfg, parser)
 
