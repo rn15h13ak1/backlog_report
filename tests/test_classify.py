@@ -29,7 +29,7 @@ def comment(created: str, from_status: str, to_status: str) -> dict:
 
 def classify(iss: dict, comments: list) -> dict:
     return classify_issue_from_comments(
-        iss, comments, PERIOD_START, PERIOD_END, CLOSED, OPEN
+        iss, comments, PERIOD_START, PERIOD_END, CLOSED
     )
 
 

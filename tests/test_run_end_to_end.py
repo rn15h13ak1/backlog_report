@@ -227,11 +227,11 @@ def test_run_names_unnamed_filters(tmp_path, stub):
 # 警告の出方
 # ==================================================================
 
-def test_run_warns_about_unlisted_status(tmp_path, stub, capsys):
-    """config のどちらにも属さないステータスがあれば警告すること"""
+def test_run_treats_unlisted_status_as_open(tmp_path, stub, capsys):
+    """完了系に登録されていないステータスはオープン系として集計されること"""
     statuses = STATUSES + [{"id": 5, "name": "レビュー中"}]
     issues = DEFAULT_ISSUES + [
-        issue(4, "レビュー中", "2026-01-10T02:00:00Z", "2026-03-05T02:00:00Z", "設定外"),
+        issue(4, "レビュー中", "2026-01-10T02:00:00Z", "2026-03-05T02:00:00Z", "完了系に未登録"),
     ]
     stub(issues=issues, statuses=statuses)
     out = tmp_path / "out"
@@ -239,9 +239,24 @@ def test_run_warns_about_unlisted_status(tmp_path, stub, capsys):
 
     bwr.run(["--config", str(config)])
 
-    assert "設定外のステータス: レビュー中" in capsys.readouterr().err
     text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "| ① 前週残件数 | **3** 件 |" in text     # PRJ-1, PRJ-2 に PRJ-4 が加わる
     assert "レビュー中" in text
+    assert "ステータス一覧に無い名前" not in capsys.readouterr().err
+
+
+def test_run_rejects_initial_status_in_closed_ids(tmp_path, stub, capsys):
+    """新規作成時のステータスを完了系に登録していたらエラーで止まること"""
+    stub()
+    config = write_config(tmp_path, tmp_path / "out",
+                          report={"closed_status_ids": [1, 3, 4]})   # 1=未対応 を含めてしまった
+
+    with pytest.raises(SystemExit):
+        bwr.run(["--config", str(config)])
+
+    err = capsys.readouterr().err
+    assert "closed_status_ids に「未対応」" in err
+    assert "新規作成されるときのステータス" in err
 
 
 def test_run_continues_when_master_fetch_fails(tmp_path, monkeypatch, capsys):
@@ -366,9 +381,9 @@ def test_run_continues_when_status_list_fails(tmp_path, monkeypatch, capsys):
     """
     ステータス一覧が取れない場合は絞り込みを諦めて全件取得し、処理は続行する。
 
-    ただしステータス名が照合できないため、①③④は判定できず0件になる。
-    ②新規発生だけは作成日で決まるので残り、⑤はその②から算出される。
-    等式は成立してしまい警告も出ないので、実行ログの警告だけが手掛かりになる。
+    完了系の集合が空になるため、すべてオープン系として扱われる。
+    ④は0件になり、対象の課題はすべて⑤に積み上がる。
+    レポートに警告は出ないので、実行ログの警告だけが手掛かりになる。
     この「気づきにくさ」を記録しておく。
     """
     monkeypatch.setattr(bwr, "BacklogClient", make_stub_client(fail_on="/statuses"))
@@ -382,12 +397,12 @@ def test_run_continues_when_status_list_fails(tmp_path, monkeypatch, capsys):
     assert "api_key の権限を確認してください" in err
 
     text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
-    assert "| ① 前週残件数 | **0** 件 |" in text     # ステータス照合ができない
+    # 完了系が空になるため、すべてオープン系として扱われる
+    assert "| ① 前週残件数 | **2** 件 |" in text
+    assert "| ② 新規発生件数 | **1** 件 |" in text
     assert "| ③ 再オープン件数 | **0** 件 |" in text
-    assert "| ④ 当週完了件数 | **0** 件 |" in text
-    assert "| ② 新規発生件数 | **1** 件 |" in text   # 作成日だけで決まるので残る
-    assert "| ⑤ 当週未完了件数 | **1** 件 |" in text
-    assert "⚠️" not in text                          # 等式は成立するため警告は出ない
+    assert "| ④ 当週完了件数 | **0** 件 |" in text   # 完了系が無いので完了を判定できない
+    assert "| ⑤ 当週未完了件数 | **3** 件 |" in text
 
 
 def test_run_continues_when_custom_field_master_fails(tmp_path, monkeypatch, capsys):

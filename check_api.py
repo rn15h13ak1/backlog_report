@@ -13,7 +13,6 @@ from pathlib import Path
 
 from backlog_weekly_report import (
     DEFAULT_CLOSED_STATUS_IDS,
-    DEFAULT_OPEN_STATUS_IDS,
     BacklogAPIError,
     BacklogClient,
     format_api_error,
@@ -36,7 +35,6 @@ def main() -> None:
 
     space_host, api_key, project_key = validate_backlog_config(backlog_cfg)
     closed_status_ids = report_cfg.get("closed_status_ids", DEFAULT_CLOSED_STATUS_IDS)
-    open_status_ids   = report_cfg.get("open_status_ids",   DEFAULT_OPEN_STATUS_IDS)
 
     client = BacklogClient(
         space_host,
@@ -48,7 +46,7 @@ def main() -> None:
 
     print(f"接続先: {client.base_url}")
     print(f"プロジェクト: {project_key}")
-    print(f"オープン系ステータスID: {open_status_ids} / 完了系ステータスID: {closed_status_ids}")
+    print(f"完了系ステータスID: {closed_status_ids}（これ以外はすべてオープン系）")
     print()
 
     # ---- Step1: 接続・認証確認（/space は最もシンプルなエンドポイント）----
@@ -77,18 +75,13 @@ def main() -> None:
 
     try:
         statuses = client.get_statuses(project_key)
-        known_ids = set(open_status_ids) | set(closed_status_ids)
-        for s in statuses:
-            if s["id"] in open_status_ids:
-                label = "オープン系"
-            elif s["id"] in closed_status_ids:
-                label = "完了系"
-            else:
-                label = "⚠ 未分類（config.yaml に未設定）"
-            print(f"   id={s['id']}: {s['name']}  → {label}")
-        missing = [s for s in statuses if s["id"] not in known_ids]
-        if missing:
-            print("   ⚠ 未分類のステータスがあります。open_status_ids / closed_status_ids を見直してください。")
+        for idx, st in enumerate(statuses):
+            label = "完了系" if st["id"] in closed_status_ids else "オープン系"
+            initial = "  ← 新規作成時のステータス" if idx == 0 else ""
+            print(f"   id={st['id']}: {st['name']}  → {label}{initial}")
+        if statuses and statuses[0]["id"] in closed_status_ids:
+            print("   ❌ 新規作成時のステータスが完了系に登録されています。"
+                  "closed_status_ids から取り除いてください。")
     except BacklogAPIError as e:
         print("❌ ステータス一覧の取得に失敗")
         print(format_api_error(e), file=sys.stderr)

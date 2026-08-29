@@ -131,7 +131,7 @@ def test_unknown_status_shows_warning_with_names():
     data = basic_data()
     data["unknown_statuses"] = {"レビュー中", "保留"}
     text = make_report(data)
-    assert "open_status_ids / closed_status_ids" in text
+    assert "ステータス一覧" in text
     # sorted() はコードポイント順のため カタカナ(U+30EC) が 漢字(U+4FDD) より先に来る
     assert "レビュー中、保留" in text
 

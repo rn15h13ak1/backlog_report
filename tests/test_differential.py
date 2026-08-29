@@ -42,6 +42,26 @@ ALL_NAMES = ["未対応", "処理中", "処理済み", "完了"]
 CLASSIFY_KEYS = ("is_carry_over", "is_new", "is_reopened", "is_completed",
                  "status_at_start", "status_at_end")
 
+# 旧実装はオープン系のIDを明示的に受け取っていた
+LEGACY_OPEN_STATUS_IDS = [1, 2]
+
+
+def is_intended_completion_change(new_result: dict, old_result: dict) -> bool:
+    """
+    ④の定義変更による意図的な差かどうかを判定する。
+
+    旧: 期間中にオープン系→完了系の変更があれば④
+    新: 加えて期間終了時点も完了系であること（期間中に完了して同じ期間中に
+        再オープンされた課題は、期末が未完了なので④に含めない）
+
+    したがって差は「旧が④、新が④でない、かつ期末がオープン系」のときだけ許される。
+    """
+    diff = {k for k in CLASSIFY_KEYS if new_result[k] != old_result[k]}
+    if diff != {"is_completed"}:
+        return False
+    return (old_result["is_completed"] and not new_result["is_completed"]
+            and new_result["status_at_end"] not in CLOSED_NAMES)
+
 # 期間: 2026-03-02 〜 2026-03-08。境界日を意図的に含める。
 D_OLD = "2026-01-15"        # ずっと前
 D_PREV = "2026-03-01"       # 期間開始の前日（JST 補正で期間内に入りうる）
@@ -150,7 +170,7 @@ def shift_comments(comments: list) -> list:
 
 def new_classify(issue, comments):
     return bwr.classify_issue_from_comments(
-        issue, comments, PERIOD_START, PERIOD_END, CLOSED_NAMES, OPEN_NAMES
+        issue, comments, PERIOD_START, PERIOD_END, CLOSED_NAMES
     )
 
 
@@ -175,11 +195,15 @@ def test_classification_differs_only_by_timezone():
     """新実装 == 旧実装（入力を JST に補正したもの）を全シナリオで確認する"""
     mismatches = []
     total = 0
+    intended = 0
     for hour in HOURS:
         for issue, comments in scenarios(hour):
             total += 1
             new_result = new_classify(issue, comments)
             old_result = old_classify(shift_issue(issue), shift_comments(comments))
+            if is_intended_completion_change(new_result, old_result):
+                intended += 1
+                continue
             diff = {k: (new_result[k], old_result[k])
                     for k in CLASSIFY_KEYS if new_result[k] != old_result[k]}
             if diff:
@@ -191,6 +215,7 @@ def test_classification_differs_only_by_timezone():
         f"{len(mismatches)}/{total} 件で新旧が不一致:\n"
         + "\n".join(f"  {d}\n    {diff}" for d, diff in mismatches[:5])
     )
+    assert intended > 0, "④の定義変更による差が1件も無い（データが不十分）"
 
 
 def test_corpus_actually_exercises_the_timezone_boundary():
@@ -215,6 +240,8 @@ def test_no_divergence_when_timezone_conversion_is_a_noop():
         for issue, comments in scenarios(hour):
             new_result = new_classify(issue, comments)
             old_result = old_classify(issue, comments)
+            if is_intended_completion_change(new_result, old_result):
+                continue
             for key in CLASSIFY_KEYS:
                 assert new_result[key] == old_result[key], describe(issue, comments)
 
@@ -294,7 +321,7 @@ def run_new(issues, comments_by_id):
     client = RecordingClient(issues, comments_by_id)
     data = bwr.collect_report_data(
         client, "PRJ", 1, PERIOD_START, PERIOD_END,
-        bwr.DEFAULT_OPEN_STATUS_IDS, bwr.DEFAULT_CLOSED_STATUS_IDS, max_workers=4,
+        bwr.DEFAULT_CLOSED_STATUS_IDS, max_workers=4,
     )
     return data, client
 
@@ -303,31 +330,60 @@ def run_old(issues, comments_by_id):
     client = RecordingClient(issues, comments_by_id)
     data = _legacy.collect_report_data(
         client, "PRJ", 1, PERIOD_START, PERIOD_END,
-        bwr.DEFAULT_OPEN_STATUS_IDS, bwr.DEFAULT_CLOSED_STATUS_IDS,
+        LEGACY_OPEN_STATUS_IDS, bwr.DEFAULT_CLOSED_STATUS_IDS,
     )
     return data, client
+
+
+def moved_from_completed_to_incomplete(issues, comments_by_id) -> set:
+    """④の定義変更により ④→⑤ へ移る課題番号（期間中に完了して同じ期間中に再オープン）"""
+    moved = set()
+    for issue in issues:
+        comments = comments_by_id.get(issue["id"], [])
+        new_result = new_classify(issue, comments)
+        old_result = old_classify(issue, comments)
+        if is_intended_completion_change(new_result, old_result):
+            moved.add(issue["issueKey"])
+    return moved
+
+
+def assert_equivalent_except_completion_rule(new_data, old_data, moved):
+    """
+    ①②③の顔ぶれは完全一致し、④⑤の差は④の定義変更ぶんだけであること。
+
+    ①の表示ステータスは比較しない。①は「④にも入る場合のみ期間開始時点、
+    それ以外は現在の値」という実装のため、④の判定が変わると表示も連動して変わる。
+    表示内容そのものは tests/test_report_format.py のゴールデン比較で担保している。
+    """
+    new_c, old_c = categorize(new_data), categorize(old_data)
+    for key in ("carry_over", "new_issues", "reopened"):
+        assert {k for k, _ in new_c[key]} == {k for k, _ in old_c[key]}, key
+    assert {k for k, _ in new_c["completed"]} == {k for k, _ in old_c["completed"]} - moved
+    assert {k for k, _ in new_c["incomplete"]} == {k for k, _ in old_c["incomplete"]} | moved
 
 
 def test_aggregation_identical_when_timezone_is_irrelevant():
     """
     UTC 02:00 のデータのみ（JST に直しても日付が変わらない）で新旧を比較する。
-    タイムゾーン補正の影響が消えるため、差が出ればスキップ最適化かリファクタの退行。
+    タイムゾーン補正の影響が消えるため、④の定義変更ぶん以外に差が出れば退行。
     """
     issues, comments_by_id = build_corpus("02")
     new_data, _ = run_new(issues, comments_by_id)
     old_data, _ = run_old(issues, comments_by_id)
-    assert categorize(new_data) == categorize(old_data)
+    moved = moved_from_completed_to_incomplete(issues, comments_by_id)
+    assert moved, "④の定義変更で移る課題が1件も無い（データが不十分）"
+    assert_equivalent_except_completion_rule(new_data, old_data, moved)
 
 
 def test_aggregation_identical_with_shifted_input_at_boundary():
     """UTC 23:00 のデータでも、旧実装に JST 補正済み入力を与えれば一致する"""
     issues, comments_by_id = build_corpus("23")
     new_data, _ = run_new(issues, comments_by_id)
-    old_data, _ = run_old(
-        [shift_issue(i) for i in issues],
-        {k: shift_comments(v) for k, v in comments_by_id.items()},
-    )
-    assert categorize(new_data) == categorize(old_data)
+    shifted_issues = [shift_issue(i) for i in issues]
+    shifted_comments = {k: shift_comments(v) for k, v in comments_by_id.items()}
+    old_data, _ = run_old(shifted_issues, shifted_comments)
+    moved = moved_from_completed_to_incomplete(issues, comments_by_id)
+    assert_equivalent_except_completion_rule(new_data, old_data, moved)
 
 
 def test_optimization_actually_skips_fetches():
@@ -383,10 +439,10 @@ def test_excluded_issues_are_only_stale_and_closed():
         assert bwr.to_local_date(issue["updated"]) < ws
 
 
-def test_issues_with_unlisted_status_are_still_fetched():
+def test_issues_with_unlisted_status_are_treated_as_open():
     """
-    config のどちらにも属さないステータスの課題は、更新が古くても取得すること。
-    集計漏れの警告を従来どおり出せるようにするため。
+    完了系に登録されていないステータスは、更新が古くても取得され、
+    オープン系として集計されること。
     """
     stale_unknown = {
         "id": 1, "issueKey": "PRJ-1",
@@ -404,9 +460,32 @@ def test_issues_with_unlisted_status_are_still_fetched():
 
     data = bwr.collect_report_data(
         client, "PRJ", 1, PERIOD_START, PERIOD_END,
-        bwr.DEFAULT_OPEN_STATUS_IDS, bwr.DEFAULT_CLOSED_STATUS_IDS, max_workers=2,
+        bwr.DEFAULT_CLOSED_STATUS_IDS, max_workers=2,
     )
-    assert data["unknown_statuses"] == {"レビュー中"}
+    # 完了系ではないのでオープン系扱い → ①に入り、完了していないので⑤にも入る
+    assert [i["issueKey"] for i in data["carry_over"]] == ["PRJ-1"]
+    assert [i["issueKey"] for i in data["incomplete"]] == ["PRJ-1"]
+    # プロジェクトのステータス一覧には存在するので「一覧に無い名前」の警告は出ない
+    assert data["unknown_statuses"] == set()
+
+
+def test_status_name_missing_from_project_list_is_reported():
+    """changeLog にプロジェクトの一覧に無いステータス名が現れたら警告すること"""
+    issue = {
+        "id": 1, "issueKey": "PRJ-1", "created": "2026-01-10T02:00:00Z",
+        "updated": "2026-03-05T02:00:00Z", "status": {"name": "処理中"},
+        "summary": "改名されたステータス", "assignee": None, "dueDate": None,
+    }
+    comments = [{
+        "id": 1, "created": "2026-03-05T02:00:00Z",
+        "changeLog": [{"field": "status", "originalValue": "旧ステータス名", "newValue": "処理中"}],
+    }]
+    client = RecordingClient([issue], {1: comments})
+    data = bwr.collect_report_data(
+        client, "PRJ", 1, PERIOD_START, PERIOD_END,
+        bwr.DEFAULT_CLOSED_STATUS_IDS, max_workers=1,
+    )
+    assert data["unknown_statuses"] == {"旧ステータス名"}
 
 
 def test_falls_back_to_full_fetch_without_statuses():

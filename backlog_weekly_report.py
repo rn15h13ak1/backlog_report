@@ -10,7 +10,7 @@ config.yaml の filters に複数のフィルターを定義すると、
   ① 前週残件数   : 期間開始より前に作成され、期間開始時点でオープンだった課題
   ② 新規発生件数 : 対象期間に新しく作成された課題
   ③ 再オープン件数: 期間開始時点で完了系だったが、期間中にオープン系へ変化した課題
-  ④ 当週完了件数 : 期間中にオープン系から完了系へ変化した課題
+  ④ 当週完了件数 : 期間中にオープン系から完了系へ変化し、期間終了時点も完了系の課題
   ⑤ 当週未完了件数: ① + ② + ③ のうち④で完了しなかった課題（等式: ① + ② + ③ = ④ + ⑤）
   各カテゴリのBacklog課題番号一覧も出力
 
@@ -56,9 +56,8 @@ import yaml
 # Backlog API は UTC で日時を返すため、日付判定は JST に変換して行う
 JST = timezone(timedelta(hours=9))
 
-# ステータスIDの既定値（config.sample.yaml / README と一致させること）
-#   1=未対応, 2=処理中 → オープン系 / 3=処理済み, 4=完了 → 完了系
-DEFAULT_OPEN_STATUS_IDS = [1, 2]
+# 完了系とみなすステータスIDの既定値（3=処理済み, 4=完了）。
+# ここに登録されていないステータスは、すべてオープン系として扱う。
 DEFAULT_CLOSED_STATUS_IDS = [3, 4]
 
 # コメント取得の並列度の既定値
@@ -519,13 +518,21 @@ def resolve_filter_params(
 # 集計ロジック
 # ==============================================================
 
+def _is_closed(status_name: str, closed_status_names: set) -> bool:
+    return status_name in closed_status_names
+
+
+def _is_open(status_name: str, closed_status_names: set) -> bool:
+    """完了系に登録されていないステータスは、すべてオープン系として扱う"""
+    return bool(status_name) and status_name not in closed_status_names
+
+
 def classify_issue_from_comments(
     issue: dict,
     comments: list,
     period_start: date,
     period_end: date,
     closed_status_names: set,
-    open_status_names: set,
 ) -> dict:
     """
     課題のコメント履歴（changeLog）を基に、対象期間における①〜⑤の分類を返す。
@@ -602,18 +609,22 @@ def classify_issue_from_comments(
     is_new        = ws <= created <= we
 
     # 期間開始時ステータスの分類（期間前作成の課題のみ意味を持つ）
-    was_open_at_start   = is_pre_period and (status_at_start in open_status_names)
-    was_closed_at_start = is_pre_period and (status_at_start in closed_status_names)
+    was_open_at_start   = is_pre_period and _is_open(status_at_start, closed_status_names)
+    was_closed_at_start = is_pre_period and _is_closed(status_at_start, closed_status_names)
 
     # 期間中の変化
-    # completed_during: オープン系 → 完了系 の変化のみ対象
-    # （完了系 → 完了系 の変化、例: 処理済み → 完了 は除外）
-    completed_during = any(
-        c["from"] in open_status_names and c["to"] in closed_status_names
-        for c in changes_in
+    # completed_during: オープン系 → 完了系 の変化があり、かつ期間終了時点も完了系。
+    # 期間中に完了して同じ期間中に再オープンされた課題は、期末時点で未完了なので④に含めない。
+    # （完了系 → 完了系 の変化、例: 処理済み → 完了 も④には含めない）
+    completed_during = (
+        any(
+            _is_open(c["from"], closed_status_names) and _is_closed(c["to"], closed_status_names)
+            for c in changes_in
+        )
+        and _is_closed(status_at_end, closed_status_names)
     )
     reopened_during  = any(
-        c["from"] in closed_status_names and c["to"] in open_status_names
+        _is_closed(c["from"], closed_status_names) and _is_open(c["to"], closed_status_names)
         for c in changes_in
     )
 
@@ -676,6 +687,29 @@ def _fetch_comments_bulk(
     return comments_map
 
 
+def validate_status_config(statuses: list, closed_status_ids: list, project_key: str) -> None:
+    """
+    closed_status_ids の妥当性を検証する。
+
+    課題は必ずプロジェクトの先頭ステータス（既定では「未対応」）で作成される。
+    これを完了系に登録すると、すべての課題が「作成時点で完了していた」ことになり、
+    ①〜⑤ の集計が破綻する。設定ミスなので実行前に止める。
+    """
+    if not statuses:
+        return
+    initial = statuses[0]
+    if initial["id"] in closed_status_ids:
+        print(
+            f"エラー: config.yaml の closed_status_ids に「{initial['name']}」"
+            f"（id={initial['id']}）が含まれています。\n"
+            f"  これはプロジェクト「{project_key}」で課題が新規作成されるときのステータスです。\n"
+            "  完了系に登録すると、すべての課題が作成時点で完了していた扱いになり集計が成り立ちません。\n"
+            "  closed_status_ids から取り除いてください。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _fetch_target_issues(
     client: BacklogClient,
     project_id: int,
@@ -735,7 +769,6 @@ def collect_report_data(
     project_id: int,
     period_start: date,
     period_end: date,
-    open_status_ids: list,
     closed_status_ids: list,
     extra_params: dict | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
@@ -756,22 +789,23 @@ def collect_report_data(
     ep = extra_params or {}
 
     # ステータス名の取得（changeLog の値との照合に使用）
+    # 完了系に登録されていないステータスは、すべてオープン系として扱う。
     statuses: list = []
     try:
         statuses = client.get_statuses(project_key)
+        validate_status_config(statuses, closed_status_ids, project_key)
         closed_status_names = {s["name"] for s in statuses if s["id"] in closed_status_ids}
-        open_status_names   = {s["name"] for s in statuses if s["id"] in open_status_ids}
         if client.debug:
+            others = {s["name"] for s in statuses} - closed_status_names
             print(f"  [DEBUG] 完了ステータス名: {closed_status_names}", file=sys.stderr)
-            print(f"  [DEBUG] オープンステータス名: {open_status_names}", file=sys.stderr)
+            print(f"  [DEBUG] オープンステータス名（完了系以外すべて）: {others}", file=sys.stderr)
     except BacklogAPIError as e:
-        print(f"  ⚠ ステータス一覧の取得に失敗しました（{project_key}）: 全件が0件として集計されます",
-              file=sys.stderr)
+        print(f"  ⚠ ステータス一覧の取得に失敗しました（{project_key}）: "
+              "すべてオープン系として集計されます", file=sys.stderr)
         print(format_api_error(e), file=sys.stderr)
         closed_status_names = set()
-        open_status_names   = set()
 
-    known_status_names = open_status_names | closed_status_names
+    project_status_names = {s["name"] for s in statuses}
 
     # ---- 集計対象の課題を取得 ----
     all_issues = _fetch_target_issues(
@@ -799,13 +833,12 @@ def collect_report_data(
         comments = comments_map.get(issue_id_val, [])
 
         result = classify_issue_from_comments(
-            issue, comments, period_start, period_end,
-            closed_status_names, open_status_names,
+            issue, comments, period_start, period_end, closed_status_names,
         )
 
-        # 設定に無いステータス名を収集（①③④の判定から漏れる原因になる）
-        if known_status_names:
-            unknown_statuses |= (result["seen_statuses"] - known_status_names)
+        # プロジェクトのステータス一覧に無い名前を収集（改名・削除された可能性がある）
+        if project_status_names:
+            unknown_statuses |= (result["seen_statuses"] - project_status_names)
 
         if client.debug:
             print(
@@ -962,16 +995,15 @@ def generate_markdown_report(
         ]
         if unknown_statuses:
             lines.append(
-                "> 次のステータスが config.yaml の open_status_ids / closed_status_ids の"
-                f"どちらにも含まれていません: {'、'.join(sorted(unknown_statuses))}"
+                "> 次のステータス名が現在のプロジェクトのステータス一覧に存在しません"
+                f"（改名または削除された可能性があります）: {'、'.join(sorted(unknown_statuses))}"
             )
         lines.append("")
 
     if unknown_statuses and lhs == rhs:
         lines += [
-            "> ⚠️ **注意**: 次のステータスが config.yaml の open_status_ids / closed_status_ids の"
-            f"どちらにも含まれていません: {'、'.join(sorted(unknown_statuses))}",
-            "> 集計から漏れている課題がある可能性があります。",
+            "> ⚠️ **注意**: 次のステータス名が現在のプロジェクトのステータス一覧に存在しません"
+            f"（改名または削除された可能性があります）: {'、'.join(sorted(unknown_statuses))}",
             "",
         ]
 
@@ -1326,8 +1358,8 @@ def _print_summary(output_path: Path, data: dict) -> None:
           f"⑤未完了: {len(data['incomplete'])} 件")
     unknown = data.get("unknown_statuses") or set()
     if unknown:
-        print(f"     ⚠ 設定外のステータス: {'、'.join(sorted(unknown))}"
-              "（open_status_ids / closed_status_ids を確認してください）", file=sys.stderr)
+        print(f"     ⚠ ステータス一覧に無い名前: {'、'.join(sorted(unknown))}"
+              "（改名または削除された可能性があります）", file=sys.stderr)
     failures = data.get("comment_failures") or set()
     if failures:
         print(f"     ⚠ コメント履歴の取得に失敗: {len(failures)} 件", file=sys.stderr)
@@ -1356,7 +1388,6 @@ def run(argv: list | None = None) -> None:
     if not output_dir.is_absolute():
         # 相対パスはスクリプトと同じディレクトリ基準で解決（フルパス実行対応）
         output_dir = Path(__file__).parent / output_dir
-    open_status_ids = report_cfg.get("open_status_ids", DEFAULT_OPEN_STATUS_IDS)
     closed_status_ids = report_cfg.get("closed_status_ids", DEFAULT_CLOSED_STATUS_IDS)
     max_workers = resolve_max_workers(report_cfg)
 
@@ -1391,7 +1422,7 @@ def run(argv: list | None = None) -> None:
         print("【フィルターなし】全課題を集計中...")
         data = collect_report_data(
             client, project_key, default_info["id"], period_start, period_end,
-            open_status_ids, closed_status_ids, max_workers=max_workers,
+            closed_status_ids, max_workers=max_workers,
         )
         report_md = generate_markdown_report(
             data, project_key, default_info["name"], period_start, period_end
@@ -1428,7 +1459,7 @@ def run(argv: list | None = None) -> None:
 
         data = collect_report_data(
             client, filter_project_key, proj_info["id"], period_start, period_end,
-            open_status_ids, closed_status_ids,
+            closed_status_ids,
             extra_params=extra_params,
             max_workers=max_workers,
         )
