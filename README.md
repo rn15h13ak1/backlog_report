@@ -253,6 +253,7 @@ custom_fields:
 reports/
   20260316_20260322/
     weekly_report.md
+    snapshot.json
 ```
 
 **フィルターありの場合（フィルターごとに 1 ファイル ＋ 横断サマリー）:**
@@ -397,5 +398,6 @@ backlog_report/
   └── reports/                   # 生成されたレポートの保存先（.gitignore で管理対象外）
         └── YYYYMMDD_YYYYMMDD/
               ├── weekly_report[_フィルター名].md
-              └── summary_report.md   # 全フィルターの横断サマリー
+              ├── summary_report.md   # 全フィルターの横断サマリー（フィルターあり時のみ）
+              └── snapshot.json       # 次回照合用の記録
 ```
