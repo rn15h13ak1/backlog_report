@@ -810,7 +810,7 @@ def apply_population_flows(data: dict, prev_incomplete: dict) -> dict:
     キーワードでも同じように動く。
     """
     prev_ids = set(prev_incomplete)
-    present_ids = {i.get("id") for i in data["all_issues"]}
+    present_ids = data["population_ids"]
 
     carry_over = list(data["carry_over"])
     new_issues = list(data["new_issues"])
@@ -1058,8 +1058,8 @@ def collect_report_data(
         "reopened":   reopened_issues,
         "unknown_statuses":  unknown_statuses,
         "comment_failures":  new_failures,
-        # 抽出対象への出入りの判定に使う（母集団に居るかどうか）
-        "all_issues": all_issues,
+        # 抽出対象への出入りの判定に使う（今回の母集団に居るかどうかを調べる）
+        "population_ids": set(all_issues_map),
         "inflow":  [],
         "outflow": [],
     }
@@ -1105,6 +1105,69 @@ def keys_str(issues: list) -> str:
     )
 
 
+def _build_notice_lines(data: dict) -> list:
+    """
+    サマリーの直下に置く注記を組み立てる。
+
+    警告は集計の状況ごとに独立しており、種類が増えても
+    generate_markdown_report 本体は変わらないようにここへ分離している。
+    """
+    carry_over, new_issues = data["carry_over"], data["new_issues"]
+    completed, incomplete = data["completed"], data["incomplete"]
+    reopened = data.get("reopened") or []
+    unknown_statuses = data.get("unknown_statuses") or set()
+    comment_failures = data.get("comment_failures") or set()
+    inflow = data.get("inflow") or []
+    outflow = data.get("outflow") or []
+    flow_unavailable = data.get("flow_unavailable") or ""
+
+    unknown_text = ("次のステータス名が現在のプロジェクトのステータス一覧に存在しません"
+                    f"（改名または削除された可能性があります）: {'、'.join(sorted(unknown_statuses))}")
+
+    lines: list = []
+
+    # 等式チェック: ① + ② + ③ = ④ + ⑤
+    lhs = len(carry_over) + len(new_issues) + len(reopened)
+    rhs = len(completed) + len(incomplete)
+    if lhs != rhs:
+        lines += [
+            f"> ⚠️ **注意**: ①残件（{len(carry_over)}）＋ ②新規（{len(new_issues)}）＋ ③再オープン（{len(reopened)}）"
+            f"＝ {lhs} に対し、④完了（{len(completed)}）＋ ⑤未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
+            "> 同一課題が複数カテゴリに重複して集計されている可能性があります。",
+        ]
+        if unknown_statuses:
+            lines.append("> " + unknown_text)
+        lines.append("")
+    elif unknown_statuses:
+        lines += ["> ⚠️ **注意**: " + unknown_text, ""]
+
+    if comment_failures:
+        lines += [
+            f"> ⚠️ **注意**: {len(comment_failures)} 件の課題でコメント履歴の取得に失敗しました。"
+            "該当課題は「期間中にステータス変化なし」として集計されています。",
+            "",
+        ]
+
+    if inflow or outflow:
+        lines.append("> 抽出対象への出入りを前回の集計と突き合わせて反映しています。")
+        if inflow:
+            lines.append(f"> 期間中に対象へ入った **{len(inflow)}** 件は ② 新規発生に含めています: "
+                         f"{keys_str(inflow)}")
+        if outflow:
+            lines.append(f"> 期間中に対象から外れた **{len(outflow)}** 件は ④ 当週完了に含めています: "
+                         f"{keys_str(outflow)}")
+        lines.append("")
+
+    if flow_unavailable:
+        lines += [
+            f"> ⚠️ **注意**: {flow_unavailable}。",
+            "> 抽出対象への出入りを判定していないため、① と ② の内訳が実態と異なる場合があります。",
+            "",
+        ]
+
+    return lines
+
+
 def generate_markdown_report(
     data: dict,
     project_key: str,
@@ -1124,12 +1187,7 @@ def generate_markdown_report(
     new_issues = data["new_issues"]
     completed = data["completed"]
     incomplete = data["incomplete"]
-    reopened = data.get("reopened", [])
-    unknown_statuses = data.get("unknown_statuses") or set()
-    comment_failures = data.get("comment_failures") or set()
-    inflow = data.get("inflow") or []
-    outflow = data.get("outflow") or []
-    flow_unavailable = data.get("flow_unavailable") or ""
+    reopened = data.get("reopened") or []
 
     title_suffix = f" — {filter_name}" if filter_name else ""
     lines = [
@@ -1158,52 +1216,7 @@ def generate_markdown_report(
         "",
     ]
 
-    # 等式チェック: ① + ② + ③ = ④ + ⑤
-    lhs = len(carry_over) + len(new_issues) + len(reopened)
-    rhs = len(completed) + len(incomplete)
-    if lhs != rhs:
-        lines += [
-            f"> ⚠️ **注意**: ①残件（{len(carry_over)}）＋ ②新規（{len(new_issues)}）＋ ③再オープン（{len(reopened)}）"
-            f"＝ {lhs} に対し、④完了（{len(completed)}）＋ ⑤未完了（{len(incomplete)}）＝ {rhs} と一致しません。",
-            "> 同一課題が複数カテゴリに重複して集計されている可能性があります。",
-        ]
-        if unknown_statuses:
-            lines.append(
-                "> 次のステータス名が現在のプロジェクトのステータス一覧に存在しません"
-                f"（改名または削除された可能性があります）: {'、'.join(sorted(unknown_statuses))}"
-            )
-        lines.append("")
-
-    if unknown_statuses and lhs == rhs:
-        lines += [
-            "> ⚠️ **注意**: 次のステータス名が現在のプロジェクトのステータス一覧に存在しません"
-            f"（改名または削除された可能性があります）: {'、'.join(sorted(unknown_statuses))}",
-            "",
-        ]
-
-    if comment_failures:
-        lines += [
-            f"> ⚠️ **注意**: {len(comment_failures)} 件の課題でコメント履歴の取得に失敗しました。"
-            "該当課題は「期間中にステータス変化なし」として集計されています。",
-            "",
-        ]
-
-    if inflow or outflow:
-        lines.append("> 抽出対象への出入りを前回の集計と突き合わせて反映しています。")
-        if inflow:
-            lines.append(f"> 期間中に対象へ入った **{len(inflow)}** 件は ② 新規発生に含めています: "
-                         f"{keys_str(inflow)}")
-        if outflow:
-            lines.append(f"> 期間中に対象から外れた **{len(outflow)}** 件は ④ 当週完了に含めています: "
-                         f"{keys_str(outflow)}")
-        lines.append("")
-
-    if flow_unavailable:
-        lines += [
-            f"> ⚠️ **注意**: {flow_unavailable}。",
-            "> 抽出対象への出入りを判定していないため、① と ② の内訳が実態と異なる場合があります。",
-            "",
-        ]
+    lines += _build_notice_lines(data)
 
     sections = [
         ("① 前週残件", carry_over,
@@ -1540,6 +1553,46 @@ class ProjectInfoCache:
 # メイン処理
 # ==============================================================
 
+def build_jobs(filters_cfg: list, default_project_key: str) -> list:
+    """
+    フィルター設定を「集計1回ぶんの仕事」の並びに変換する。
+
+    フィルターを定義していない場合も1件の仕事として扱うことで、
+    集計から書き出しまでの流れを1本にまとめられる。
+
+    各要素のキー:
+        cfg           : フィルター設定（フィルターなしなら空）
+        name          : レポートの見出しに使う名前（フィルターなしなら None）
+        description   : レポートに載せるメモ
+        condition     : 絞り込み条件の文字列（スナップショットの照合にも使う）
+        project_key   : 集計対象のプロジェクト
+        need_master   : 種別・カスタム属性のマスターが必要か
+        snapshot_name : スナップショット上の名前
+        filename      : 出力するファイル名
+    """
+    if not filters_cfg:
+        return [{
+            "cfg": {}, "name": None, "description": "", "condition": "",
+            "project_key": default_project_key, "need_master": False,
+            "snapshot_name": NO_FILTER_NAME, "filename": "weekly_report.md",
+        }]
+
+    jobs = []
+    for i, cfg in enumerate(filters_cfg, 1):
+        name = cfg.get("name") or f"filter_{i}"
+        jobs.append({
+            "cfg": cfg,
+            "name": name,
+            "description": cfg.get("description") or "",
+            "condition": build_filter_summary(cfg),
+            "project_key": cfg.get("project_key") or default_project_key,
+            "need_master": True,
+            "snapshot_name": name,
+            "filename": f"weekly_report_{safe_filename(name)}.md",
+        })
+    return jobs
+
+
 def _apply_flows(data: dict, snapshot: dict | None, filter_name: str,
                  condition: str, snapshot_reason: str) -> dict:
     """前回⑤と突き合わせて抽出対象への出入りを反映する（できない場合はそのまま返す）"""
@@ -1629,87 +1682,64 @@ def run(argv: list | None = None) -> None:
     output_dir = output_dir / period_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- フィルターなし（filters が空の場合）----
-    if not filters_cfg:
-        default_info = projects.get(project_key)
-        print("【フィルターなし】全課題を集計中...")
-        data = collect_report_data(
-            client, project_key, default_info["id"], period_start, period_end,
-            closed_status_ids, max_workers=max_workers,
-        )
-        data = _apply_flows(data, prev_snapshot, NO_FILTER_NAME, "", snapshot_reason)
-        report_md = generate_markdown_report(
-            data, project_key, default_info["name"], period_start, period_end
-        )
-        output_path = output_dir / "weekly_report.md"
-        output_path.write_text(report_md, encoding="utf-8")
-        _print_summary(output_path, data)
-        write_snapshot(output_dir, build_snapshot(
-            period_start, period_end, [(NO_FILTER_NAME, "", data)]
-        ))
-        return
-
-    # ---- フィルターごとに集計・出力 ----
+    # ---- 集計・出力（フィルターなしも「1件の仕事」として同じ流れで扱う）----
+    jobs = build_jobs(filters_cfg, project_key)
     all_filter_data = []
     snapshot_entries: list = []
-    for i, filter_cfg in enumerate(filters_cfg, 1):
-        filter_name = filter_cfg.get("name") or f"filter_{i}"
-        filter_desc = filter_cfg.get("description") or ""
 
-        # フィルター個別の project_key（未指定ならデフォルトを使用）
-        filter_project_key = filter_cfg.get("project_key") or project_key
+    for i, job in enumerate(jobs, 1):
+        proj_info = projects.get(job["project_key"], need_master=job["need_master"])
 
-        # プロジェクト情報をキャッシュ付きで取得（初回のみ API 呼び出し）
-        proj_info = projects.get(filter_project_key, need_master=True)
-        filter_summary = build_filter_summary(filter_cfg)
+        if job["name"]:
+            print(f"[{i}/{len(jobs)}] フィルター「{job['name']}」を集計中...")
+            if job["project_key"] != project_key:
+                print(f"         プロジェクト: {job['project_key']}")
+            print(f"         条件: {job['condition']}")
+        else:
+            print("【フィルターなし】全課題を集計中...")
 
-        print(f"[{i}/{len(filters_cfg)}] フィルター「{filter_name}」を集計中...")
-        if filter_project_key != project_key:
-            print(f"         プロジェクト: {filter_project_key}")
-        print(f"         条件: {filter_summary}")
-
-        # フィルターパラメータを解決
         extra_params = resolve_filter_params(
-            filter_cfg, proj_info["issue_type_map"], proj_info["custom_field_map"]
+            job["cfg"], proj_info["issue_type_map"], proj_info["custom_field_map"]
         )
         if args.debug:
             print(f"  [DEBUG] 解決済みフィルターパラメータ: {extra_params}", file=sys.stderr)
 
         data = collect_report_data(
-            client, filter_project_key, proj_info["id"], period_start, period_end,
+            client, job["project_key"], proj_info["id"], period_start, period_end,
             closed_status_ids,
             extra_params=extra_params,
             max_workers=max_workers,
         )
-        data = _apply_flows(data, prev_snapshot, filter_name, filter_summary, snapshot_reason)
+        data = _apply_flows(data, prev_snapshot, job["snapshot_name"],
+                            job["condition"], snapshot_reason)
 
         report_md = generate_markdown_report(
-            data, filter_project_key, proj_info["name"], period_start, period_end,
-            filter_name=filter_name,
-            filter_description=filter_desc,
-            filter_summary=filter_summary,
+            data, job["project_key"], proj_info["name"], period_start, period_end,
+            filter_name=job["name"],
+            filter_description=job["description"],
+            filter_summary=job["condition"] or None,
         )
 
-        all_filter_data.append((filter_name, data))
-        snapshot_entries.append((filter_name, filter_summary, data))
+        all_filter_data.append((job["name"], data))
+        snapshot_entries.append((job["snapshot_name"], job["condition"], data))
 
-        safe_name = safe_filename(filter_name)
-        output_path = output_dir / f"weekly_report_{safe_name}.md"
+        output_path = output_dir / job["filename"]
         output_path.write_text(report_md, encoding="utf-8")
         _print_summary(output_path, data)
-        print()
+        if job["name"]:
+            print()
 
-    # ---- サマリーレポート出力 ----
-    if all_filter_data:
+    # ---- サマリーレポート出力（フィルターを定義しているときだけ）----
+    if filters_cfg:
         summary_md = generate_summary_report(all_filter_data, period_start, period_end)
         summary_path = output_dir / "summary_report.md"
         summary_path.write_text(summary_md, encoding="utf-8")
         print(f"  ✅ サマリー保存: {summary_path}")
 
-    if snapshot_entries:
-        snapshot_path = write_snapshot(output_dir, build_snapshot(
-            period_start, period_end, snapshot_entries
-        ))
+    snapshot_path = write_snapshot(output_dir, build_snapshot(
+        period_start, period_end, snapshot_entries
+    ))
+    if filters_cfg:
         print(f"  ✅ 次回照合用の記録: {snapshot_path}")
 
 
