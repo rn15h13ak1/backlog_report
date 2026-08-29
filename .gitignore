@@ -19,3 +19,6 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+
+# pip install -e の生成物
+*.egg-info/
