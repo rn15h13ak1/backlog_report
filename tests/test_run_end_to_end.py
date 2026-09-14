@@ -724,3 +724,37 @@ def test_snapshot_lookup_skips_non_matching_filters(tmp_path):
     found, reason = bwr.previous_incomplete(snapshot, "目的のフィルター", "種別: バグ")
     assert reason == ""
     assert list(found) == [2]      # 先頭の別フィルターは読み飛ばされる
+
+
+def test_deleted_issue_is_treated_as_outflow(tmp_path, stub):
+    """
+    削除された課題は「抽出対象から外れた」と同じ扱いになること。
+
+    判定は「前回⑤に居たのに今回は取得できなかった」という差分だけを見るため、
+    削除・別プロジェクトへの移動・属性変更は区別されない。仕様として固定しておく。
+    """
+    deleted = issue(99, "処理中", "2026-01-05T02:00:00Z", "2026-02-20T02:00:00Z", "削除された")
+    out = tmp_path / "out"
+    write_prev_snapshot(out, [(bwr.NO_FILTER_NAME, "", DEFAULT_ISSUES + [deleted])])
+    stub()   # 今回 API は PRJ-99 を一切返さない（削除された想定）
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "期間中に対象から外れた **1** 件は ④ 当週完了に含めています: PRJ-99" in text
+    # 存在しない課題でも、前回の記録から復元して表示できる（API は叩かない）
+    assert "| PRJ-99 | 削除された99 | 処理中 |" in text
+    assert "PRJ-99" not in read_snapshot(out)["filters"][0]["incomplete"][0]["issueKey"]
+
+
+def test_deleted_issue_absent_from_previous_incomplete_has_no_effect(tmp_path, stub):
+    """前回⑤に載っていなかった課題が削除されても、集計には現れないこと"""
+    out = tmp_path / "out"
+    write_prev_snapshot(out, [(bwr.NO_FILTER_NAME, "", DEFAULT_ISSUES)])   # PRJ-99 は含まない
+    stub()
+
+    bwr.run(["--config", str(write_config(tmp_path, out))])
+
+    text = (out / PERIOD_DIR / "weekly_report.md").read_text(encoding="utf-8")
+    assert "PRJ-99" not in text
+    assert "対象から外れた" not in text
