@@ -1294,7 +1294,8 @@ def _weekly3_column(entries: list, note: str = "") -> list:
     """
     1 列ぶんの本文を組み立てる。
 
-    entries: [(分類名, 件数の dict, カードにする課題のリスト)]
+    entries: [(分類名, 件数の dict, カードにする課題のリスト, 分類ごとの注記)]
+    分類ごとの注記があるときは、件数と課題の代わりにその注記だけを出す。
     """
     if note:
         return [f"_（{note}）_", ""]
@@ -1302,8 +1303,12 @@ def _weekly3_column(entries: list, note: str = "") -> list:
         return ["_（対象なし）_", ""]
 
     lines: list = []
-    for name, counts, issues in entries:
-        lines += [f"### {name}", "", _weekly3_counts(counts), ""]
+    for name, counts, issues, entry_note in entries:
+        lines += [f"### {name}", ""]
+        if entry_note:
+            lines += [f"_（{entry_note}）_", ""]
+            continue
+        lines += [_weekly3_counts(counts), ""]
         lines += [_weekly3_entry(i) for i in issues] if issues else ["_（該当なし）_"]
         lines.append("")
     return lines
@@ -1341,6 +1346,7 @@ def generate_weekly3_report(
     period_end: date,
     prev_snapshot: dict | None,
     snapshot_reason: str = "",
+    conditions: dict | None = None,
 ) -> str:
     """
     docmold の `weekly3` に渡す Markdown を組み立てる。
@@ -1350,6 +1356,9 @@ def generate_weekly3_report(
 
     列の見出しには期間を自分で書き込む。docmold 側の `column_periods` は
     見出しに区切り（〜）があれば触らないので、7 日以外の期間でも正しく出る。
+
+    conditions: {分類名: 今回の絞り込み条件}。前回と違う分類は、数えている対象が
+    違うため前週の列に数字を出さない。
     """
     length = (period_end - period_start).days + 1
     prev_end = period_start - timedelta(days=1)
@@ -1360,20 +1369,36 @@ def generate_weekly3_report(
     span = "{0.month}/{0.day}〜{1.month}/{1.day}".format
 
     # ---- 前週の列は前回のスナップショットから組み立てる ----
+    conditions = conditions or {}
     prev_entries: list = []
     prev_note = snapshot_reason or "前回の集計結果が見つかりませんでした"
     if prev_snapshot:
         prev_note = ""
         for entry in prev_snapshot.get("filters", []):
+            name = entry.get("name")
             counts = entry.get("counts")
             if counts is None:
                 prev_note = "前回の記録に件数が含まれていません（次回の実行から表示されます）"
                 prev_entries = []
                 break
+
+            # 絞り込み条件が変わっていたら、数えている対象が違うので数字を並べない。
+            # 同じ分類名のまま条件だけ変えることがあり、見比べると誤読につながる。
+            previous = entry.get("condition", "")
+            current = conditions.get(name)
+            if current is not None and previous != current:
+                prev_entries.append((
+                    _weekly3_name(name), None, [],
+                    "絞り込み条件が今回と異なるため表示しません"
+                    f"（前回: {previous or 'なし'}）",
+                ))
+                continue
+
             issues = (entry.get("completed") or []) + (entry.get("incomplete") or [])
             prev_entries.append((
-                _weekly3_name(entry.get("name")), counts,
+                _weekly3_name(name), counts,
                 sorted((_from_snapshot_entry(i) for i in issues), key=_issue_sort_key),
+                "",
             ))
 
     lines = [
@@ -1408,7 +1433,7 @@ def generate_weekly3_report(
     lines += [f"## 今週（{span(period_start, period_end)}）", ""]
     lines += _weekly3_column([
         (_weekly3_name(name), {key: len(data[key]) for key in CATEGORY_KEYS},
-         sorted(data["completed"] + data["incomplete"], key=_issue_sort_key))
+         sorted(data["completed"] + data["incomplete"], key=_issue_sort_key), "")
         for name, data in all_filter_data
     ])
 
@@ -1955,6 +1980,7 @@ def run(argv: list | None = None) -> None:
     weekly3_md = generate_weekly3_report(
         all_filter_data, project_key, projects.get(project_key)["name"],
         period_start, period_end, prev_snapshot, snapshot_reason,
+        conditions={name: condition for name, condition, _ in snapshot_entries},
     )
     weekly3_path = output_dir / "weekly3_report.md"
     weekly3_path.write_text(weekly3_md, encoding="utf-8")

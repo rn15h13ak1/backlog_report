@@ -19,10 +19,10 @@ import backlog_weekly_report as bwr
 from tests.report_fixtures import PERIOD_END, PERIOD_START, basic_data, issue
 
 
-def make(prev_snapshot=None, reason="", data=None, name="バグ対応"):
+def make(prev_snapshot=None, reason="", data=None, name="バグ対応", conditions=None):
     return bwr.generate_weekly3_report(
         [(name, data or basic_data())], "PRJ", "テストプロジェクト",
-        PERIOD_START, PERIOD_END, prev_snapshot, reason,
+        PERIOD_START, PERIOD_END, prev_snapshot, reason, conditions,
     )
 
 
@@ -286,3 +286,55 @@ def test_snapshot_period_start_is_readable_from_the_first_format():
            "period": {"from": "2026-02-23", "to": "2026-03-01"},
            "filters": [{"name": "バグ対応", "condition": "", "incomplete": []}]}
     assert bwr._snapshot_period_start(old) == date(2026, 2, 23)
+
+
+# ==================================================================
+# 絞り込み条件が変わった場合
+# ==================================================================
+
+def test_previous_column_hides_numbers_when_condition_changed():
+    """
+    条件が変わった分類は、前週の列に数字を出さないこと。
+
+    同じ分類名のまま条件だけ変えることがあり、数えている対象が違う数字が
+    横に並ぶと誤読につながる。
+    """
+    snap = prev_snapshot(counts={k: 9 for k in bwr.CATEGORY_KEYS})
+    snap["filters"][0]["condition"] = "種別: タスク"
+    column = make(prev_snapshot=snap, conditions={"バグ対応": "種別: バグ"}) \
+        .split("## 前週")[1].split("## 今週")[0]
+
+    assert "### バグ対応" in column          # 見出しは残す（列の位置がずれないように）
+    assert "絞り込み条件が今回と異なるため表示しません（前回: 種別: タスク）" in column
+    assert "残:9" not in column
+
+
+def test_previous_column_shows_numbers_when_condition_matches():
+    snap = prev_snapshot(counts={k: 9 for k in bwr.CATEGORY_KEYS})
+    snap["filters"][0]["condition"] = "種別: バグ"
+    column = make(prev_snapshot=snap, conditions={"バグ対応": "種別: バグ"}) \
+        .split("## 前週")[1].split("## 今週")[0]
+
+    assert "残:9 / 新規:9 / 再オープン:9 / 完了:9 / 未完了:9" in column
+
+
+def test_condition_check_is_skipped_for_filters_not_in_this_run():
+    """今回の実行に無い分類は、比べる相手がいないのでそのまま出すこと"""
+    snap = prev_snapshot(counts={k: 5 for k in bwr.CATEGORY_KEYS}, name="消えた分類")
+    snap["filters"][0]["condition"] = "種別: 何か"
+    column = make(prev_snapshot=snap, conditions={"バグ対応": "種別: バグ"}) \
+        .split("## 前週")[1].split("## 今週")[0]
+
+    assert "### 消えた分類" in column
+    assert "残:5" in column
+
+
+def test_empty_condition_on_both_sides_matches():
+    """フィルターなしの実行（条件が空）同士は一致とみなすこと"""
+    snap = prev_snapshot(counts={k: 2 for k in bwr.CATEGORY_KEYS}, name=bwr.NO_FILTER_NAME)
+    snap["filters"][0]["condition"] = ""
+    column = make(prev_snapshot=snap, name=None, conditions={bwr.NO_FILTER_NAME: ""}) \
+        .split("## 前週")[1].split("## 今週")[0]
+
+    assert "### 全課題" in column
+    assert "残:2" in column
