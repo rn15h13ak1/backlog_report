@@ -402,6 +402,13 @@ python -m tests.regen_golden
 
 ---
 
+## 変更履歴
+
+[CHANGELOG.md](CHANGELOG.md) を参照。バージョンはコミット履歴から
+さかのぼって付けたもので、タグは打っていません。
+
+---
+
 ## ファイル構成
 
 ```
@@ -411,6 +418,7 @@ backlog_report/
   ├── config.sample.yaml         # 設定ファイルのテンプレート（これをコピーして config.yaml を作成）
   ├── config.yaml                # 実際の設定ファイル（.gitignore で管理対象外）
   ├── pyproject.toml             # 依存関係・pytest / ruff / カバレッジの設定
+  ├── CHANGELOG.md               # 変更履歴
   ├── tests/                     # 単体テスト
   │     ├── golden/              # レポート出力の比較用ファイル
   │     └── _legacy.py           # 差分テスト用に凍結した旧実装
