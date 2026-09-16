@@ -71,6 +71,10 @@ API_PAGE_SIZE = 100    # Backlog API の1回あたり最大取得件数
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 RETRY_MAX_DELAY = 60.0  # リトライ1回あたりの最大待機秒数
 
+# ①〜⑤ の並び（集計結果のキーと、件数表示に使うラベル）
+CATEGORY_KEYS = ("carry_over", "new_issues", "reopened", "completed", "incomplete")
+CATEGORY_LABELS = ("残", "新規", "再オープン", "完了", "未完了")
+
 # レポート表示上限
 TABLE_MAX_DISPLAY = 30
 TABLE_MAX_DISPLAY_INCOMPLETE = 50
@@ -709,7 +713,11 @@ def build_snapshot(period_start: date, period_end: date, entries: list) -> dict:
     次回実行時に「抽出対象から外れた課題」を検知するための記録。
 
     entries: [(フィルター名, 絞り込み条件の文字列, 集計結果)] のリスト。
-    ⑤の課題だけを残す。次回の①と突き合わせて差分を取るために使う。
+
+    incomplete（⑤）は次回の①と突き合わせて出入りを判定するために使う。
+    counts と completed（④）は、次回の weekly3 レポートで「前週」の列を
+    組み立てるために使う。読む側は欠けていても動くので、これらを足しても
+    以前の形式のスナップショットはそのまま使える。
     """
     return {
         "version": SNAPSHOT_VERSION,
@@ -721,6 +729,8 @@ def build_snapshot(period_start: date, period_end: date, entries: list) -> dict:
             {
                 "name": name,
                 "condition": condition,
+                "counts": {key: len(data[key]) for key in CATEGORY_KEYS},
+                "completed":  [_snapshot_entry(i) for i in data["completed"]],
                 "incomplete": [_snapshot_entry(i) for i in data["incomplete"]],
             }
             for name, condition, data in entries
@@ -1266,6 +1276,189 @@ def generate_markdown_report(
     return "\n".join(lines)
 
 
+def _weekly3_entry(issue: dict) -> str:
+    """weekly3 のカード 1 件（`課題番号｜期限：m/d｜ステータス｜件名`）"""
+    key = issue.get("issueKey", "-")
+    status = issue.get("status", {}).get("name", "-")
+    summary = (issue.get("summary") or "-").replace("｜", "／")
+    return f"- {key}｜期限：{_fmt_due(issue.get('dueDate'))}｜{status}｜{summary}"
+
+
+def _weekly3_counts(counts: dict) -> str:
+    """件数の並び（count_summary が拾う形式）"""
+    return " / ".join(f"{label}:{counts.get(key, 0)}"
+                      for key, label in zip(CATEGORY_KEYS, CATEGORY_LABELS, strict=True))
+
+
+def _weekly3_column(entries: list, note: str = "") -> list:
+    """
+    1 列ぶんの本文を組み立てる。
+
+    entries: [(分類名, 件数の dict, カードにする課題のリスト)]
+    """
+    if note:
+        return [f"_（{note}）_", ""]
+    if not entries:
+        return ["_（対象なし）_", ""]
+
+    lines: list = []
+    for name, counts, issues in entries:
+        lines += [f"### {name}", "", _weekly3_counts(counts), ""]
+        lines += [_weekly3_entry(i) for i in issues] if issues else ["_（該当なし）_"]
+        lines.append("")
+    return lines
+
+
+def _weekly3_plan_column(entries: list, next_start: date) -> list:
+    """
+    「来週の予定」の列。⑤ をそのまま持ち越し、期限を過ぎているものを数える。
+
+    期限が次の期間の開始日より前の課題は、ステータスを「期限超過」として出す
+    （docmold 側で状態バッジになる）。
+    """
+    deadline = next_start.isoformat()
+    lines: list = []
+    for name, issues in entries:
+        overdue = [i for i in issues if (i.get("dueDate") or "")[:10] < deadline
+                   and i.get("dueDate")]
+        lines += [f"### {name}", "",
+                  f"予定:{len(issues)} / 期限切れ:{len(overdue)}", ""]
+        if issues:
+            overdue_ids = {i.get("id") for i in overdue}
+            lines += [_weekly3_entry(_with_status(i, "期限超過") if i.get("id") in overdue_ids else i)
+                      for i in issues]
+        else:
+            lines.append("_（該当なし）_")
+        lines.append("")
+    return lines or ["_（対象なし）_", ""]
+
+
+def generate_weekly3_report(
+    all_filter_data: list,
+    project_key: str,
+    project_name: str,
+    period_start: date,
+    period_end: date,
+    prev_snapshot: dict | None,
+    snapshot_reason: str = "",
+) -> str:
+    """
+    docmold の `weekly3` に渡す Markdown を組み立てる。
+
+    見出し 2 を 4 つ置き、1 つ目をトピックス、2 〜 4 つ目を 3 列として並べる。
+    真ん中の列が今回の集計で、左が前回、右が次の期間の予定にあたる。
+
+    列の見出しには期間を自分で書き込む。docmold 側の `column_periods` は
+    見出しに区切り（〜）があれば触らないので、7 日以外の期間でも正しく出る。
+    """
+    length = (period_end - period_start).days + 1
+    prev_start, prev_end = period_start - timedelta(days=length), period_start - timedelta(days=1)
+    next_start, next_end = period_end + timedelta(days=1), period_end + timedelta(days=length)
+    span = "{0.month}/{0.day}〜{1.month}/{1.day}".format
+
+    # ---- 前週の列は前回のスナップショットから組み立てる ----
+    prev_entries: list = []
+    prev_note = snapshot_reason or "前回の集計結果が見つかりませんでした"
+    if prev_snapshot:
+        prev_note = ""
+        for entry in prev_snapshot.get("filters", []):
+            counts = entry.get("counts")
+            if counts is None:
+                prev_note = "前回の記録に件数が含まれていません（次回の実行から表示されます）"
+                prev_entries = []
+                break
+            issues = (entry.get("completed") or []) + (entry.get("incomplete") or [])
+            prev_entries.append((
+                _weekly3_name(entry.get("name")), counts,
+                sorted((_from_snapshot_entry(i) for i in issues), key=_issue_sort_key),
+            ))
+
+    lines = [
+        "---",
+        "type: weekly3",
+        f"title: {project_name} 課題サマリー",
+        f"期間: {period_start.isoformat()} 〜 {period_end.isoformat()}",
+        "---",
+        "",
+        "## トピックス",
+        "",
+        "### 集計の概要",
+        "",
+        f"プロジェクト **{project_name}**（`{project_key}`）の "
+        f"{period_start:%Y/%m/%d} 〜 {period_end:%Y/%m/%d} の集計。",
+        "",
+        f"| 区分 | {' | '.join(CATEGORY_LABELS)} |",
+        "| --- | " + " | ".join("--:" for _ in CATEGORY_LABELS) + " |",
+    ]
+    for name, data in all_filter_data:
+        counts = [str(len(data[key])) for key in CATEGORY_KEYS]
+        lines.append(f"| {_weekly3_name(name)} | {' | '.join(counts)} |")
+    lines.append("")
+
+    notices = _weekly3_notices(all_filter_data)
+    if notices:
+        lines += ["### 注意", ""] + notices + [""]
+
+    lines += [f"## 前週（{span(prev_start, prev_end)}）", ""]
+    lines += _weekly3_column(prev_entries, prev_note)
+
+    lines += [f"## 今週（{span(period_start, period_end)}）", ""]
+    lines += _weekly3_column([
+        (_weekly3_name(name), {key: len(data[key]) for key in CATEGORY_KEYS},
+         sorted(data["completed"] + data["incomplete"], key=_issue_sort_key))
+        for name, data in all_filter_data
+    ])
+
+    lines += [f"## 来週の予定（{span(next_start, next_end)}）", ""]
+    lines += _weekly3_plan_column(
+        [(_weekly3_name(name), sorted(data["incomplete"], key=_issue_sort_key))
+         for name, data in all_filter_data],
+        next_start,
+    )
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _weekly3_name(name: str | None) -> str:
+    """フィルターなしのときの分類名"""
+    if not name or name == NO_FILTER_NAME:
+        return "全課題"
+    return name
+
+
+def _from_snapshot_entry(saved: dict) -> dict:
+    """スナップショットの記録を、表示用の課題の形に戻す"""
+    return {
+        "id": saved.get("id"),
+        "issueKey": saved.get("issueKey"),
+        "summary": saved.get("summary"),
+        "status": {"name": saved.get("status") or "-"},
+        "dueDate": saved.get("dueDate"),
+    }
+
+
+def _weekly3_notices(all_filter_data: list) -> list:
+    """トピックスに載せる注意書き（該当がなければ空）"""
+    lines: list = []
+    for name, data in all_filter_data:
+        label = _weekly3_name(name)
+        if data.get("inflow"):
+            lines.append(f"- {label}: 期間中に対象へ入った {len(data['inflow'])} 件を "
+                         f"② 新規発生に含めた（{keys_str(data['inflow'])}）")
+        if data.get("outflow"):
+            lines.append(f"- {label}: 期間中に対象から外れた {len(data['outflow'])} 件を "
+                         f"④ 当週完了に含めた（{keys_str(data['outflow'])}）")
+        if data.get("comment_failures"):
+            lines.append(f"- {label}: {len(data['comment_failures'])} 件の課題で"
+                         "コメント履歴を取得できなかった")
+        if data.get("unknown_statuses"):
+            lines.append(f"- {label}: ステータス一覧に無い名前があった"
+                         f"（{'、'.join(sorted(data['unknown_statuses']))}）")
+        if data.get("flow_unavailable"):
+            lines.append(f"- {label}: {data['flow_unavailable']}")
+    return lines
+
+
 def build_filter_summary(filter_cfg: dict) -> str:
     """フィルター条件の人間向け要約文字列を生成"""
     parts = []
@@ -1323,17 +1516,11 @@ def generate_summary_report(
     ]
 
     for idx, (filter_name, data) in enumerate(all_filter_data):
-        carry_over = data["carry_over"]
-        new_issues = data["new_issues"]
-        reopened   = data["reopened"]
         completed  = data["completed"]
         incomplete = data["incomplete"]
 
         lines.append(filter_name)
-        lines.append(
-            f"残:{len(carry_over)} / 新規:{len(new_issues)} / "
-            f"再オープン:{len(reopened)} / 完了:{len(completed)} / 未完了:{len(incomplete)}"
-        )
+        lines.append(_weekly3_counts({key: len(data[key]) for key in CATEGORY_KEYS}))
 
         for issue in sorted(completed + incomplete, key=_issue_sort_key):
             key    = issue.get("issueKey", "-")
@@ -1745,6 +1932,14 @@ def run(argv: list | None = None) -> None:
         summary_path = output_dir / "summary_report.md"
         summary_path.write_text(summary_md, encoding="utf-8")
         print(f"  ✅ サマリー保存: {summary_path}")
+
+    weekly3_md = generate_weekly3_report(
+        all_filter_data, project_key, projects.get(project_key)["name"],
+        period_start, period_end, prev_snapshot, snapshot_reason,
+    )
+    weekly3_path = output_dir / "weekly3_report.md"
+    weekly3_path.write_text(weekly3_md, encoding="utf-8")
+    print(f"  ✅ weekly3 用に保存: {weekly3_path}")
 
     snapshot_path = write_snapshot(output_dir, build_snapshot(
         period_start, period_end, snapshot_entries

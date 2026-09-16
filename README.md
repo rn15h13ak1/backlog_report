@@ -274,6 +274,7 @@ custom_fields:
 reports/
   20260316_20260322/
     weekly_report.md
+    weekly3_report.md
     snapshot.json
 ```
 
@@ -285,14 +286,27 @@ reports/
     weekly_report_Aチーム_タスク.md
     weekly_report_優先度_高.md
     summary_report.md
+    weekly3_report.md
     snapshot.json
 ```
 
 `summary_report.md` は全フィルターの件数と、完了・未完了の課題一覧をまとめたものです。
 Excel へコピー＆ペーストして使う想定の形式になっています。
 
-`snapshot.json` は次回実行時の照合に使う記録です（各フィルターの⑤と絞り込み条件）。
-削除すると、次回は抽出対象への出入りを判定できなくなります。
+`weekly3_report.md` は [docmold](https://github.com/rn15h13ak1/docmold) の `weekly3` に
+渡すための Markdown です。前週・今週・来週の予定を 3 列に並べた HTML に変換できます。
+
+```bash
+python ~/ws/docmold/docmold.py reports/20260316_20260322/weekly3_report.md
+```
+
+- 真ん中の列が今回の集計、左が前回（`snapshot.json` から復元）、右が⑤の持ち越しです
+- 列の見出しには期間を書き込んであるため、7 日以外の期間でも正しい範囲が出ます
+- 来週の予定では、期限を過ぎている課題のステータスを「期限超過」として出します
+- 前回の記録が無い場合、左の列にはその旨が入ります
+
+`snapshot.json` は次回実行時の照合に使う記録です（各フィルターの⑤・④・件数と絞り込み条件）。
+削除すると、次回は抽出対象への出入りの判定と、weekly3 の「前週」の列が作れなくなります。
 
 ### レポートの構成
 
@@ -377,6 +391,8 @@ python -m pytest tests/ -v
 - レポート出力の形式（`tests/golden/` に保存した出力との全文比較）
 - 旧実装との差分比較（`tests/_legacy.py` と突き合わせ、合成データ832ケース）
 - 抽出対象への出入り（流入が②に、流出が④に入ること、条件変更時は判定しないこと）
+- weekly3 用 Markdown の形式（見出しの数と並び、列の期間、件数と課題カードの書式）と、
+  docmold で警告なく変換できること
 - 週を連鎖させた通し検証（3週続けて実行し、毎週 `前週⑤ = 今週①` と等式が成立すること、
   実行順を変えても⑤が変わらないこと、各カテゴリの表示ステータスの基準）
 - 設定の読み込みからファイル書き出しまでの通し実行（HTTP 通信だけを差し替え、
