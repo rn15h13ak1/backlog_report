@@ -239,3 +239,50 @@ def test_docmold_converts_without_warnings(tmp_path):
     ]
     assert "dm-entry__key" in body     # 課題がカードになっている
     assert "dm-count__label" in body   # 件数がチップになっている
+
+
+# ==================================================================
+# 前週の見出しに出す期間
+# ==================================================================
+
+def test_previous_heading_uses_the_recorded_period():
+    """
+    前週の見出しは、記録された期間をそのまま使うこと。
+
+    今回の長さから逆算すると、前回が違う長さだった場合にずれる。
+    """
+    snap = prev_snapshot(counts={k: 0 for k in bwr.CATEGORY_KEYS})
+    snap["period"] = {"from": "2026-02-27", "to": "2026-03-01"}   # 3 日間
+    _, previous, *_ = headings(make(prev_snapshot=snap))          # 今回は 7 日間
+    assert previous == "前週（2/27〜3/1）"
+
+
+@pytest.mark.parametrize("period", [
+    None,                                   # キーごと無い
+    {},                                     # 空
+    {"to": "2026-03-01"},                   # from が無い
+    {"from": "", "to": "2026-03-01"},       # 空文字
+    {"from": "2026年2月23日"},               # 日付として読めない
+])
+def test_previous_heading_falls_back_when_period_is_unreadable(period):
+    """期間が読めない場合は、今回の長さから逆算した範囲で補うこと"""
+    snap = prev_snapshot(counts={k: 0 for k in bwr.CATEGORY_KEYS})
+    if period is None:
+        del snap["period"]
+    else:
+        snap["period"] = period
+    _, previous, *_ = headings(make(prev_snapshot=snap))
+    assert previous == "前週（2/23〜3/1）"
+
+
+def test_previous_heading_without_snapshot():
+    _, previous, *_ = headings(make(reason="記録がありません"))
+    assert previous == "前週（2/23〜3/1）"
+
+
+def test_snapshot_period_start_is_readable_from_the_first_format():
+    """最初の形式（件数を持たない）のスナップショットからも期間を読めること"""
+    old = {"version": bwr.SNAPSHOT_VERSION,
+           "period": {"from": "2026-02-23", "to": "2026-03-01"},
+           "filters": [{"name": "バグ対応", "condition": "", "incomplete": []}]}
+    assert bwr._snapshot_period_start(old) == date(2026, 2, 23)

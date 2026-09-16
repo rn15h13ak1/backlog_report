@@ -1352,7 +1352,10 @@ def generate_weekly3_report(
     見出しに区切り（〜）があれば触らないので、7 日以外の期間でも正しく出る。
     """
     length = (period_end - period_start).days + 1
-    prev_start, prev_end = period_start - timedelta(days=length), period_start - timedelta(days=1)
+    prev_end = period_start - timedelta(days=1)
+    # 前回の期間は記録されたものを使う。今回の長さから逆算すると、前回が違う長さ
+    # だった場合に見出しの範囲がずれる。読めない場合だけ今回の長さで補う。
+    prev_start = _snapshot_period_start(prev_snapshot) or (period_start - timedelta(days=length))
     next_start, next_end = period_end + timedelta(days=1), period_end + timedelta(days=length)
     span = "{0.month}/{0.day}〜{1.month}/{1.day}".format
 
@@ -1417,6 +1420,22 @@ def generate_weekly3_report(
     )
 
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _snapshot_period_start(snapshot: dict | None) -> date | None:
+    """
+    スナップショットに記録された期間の開始日。読めなければ None。
+
+    期間は最初の形式から記録されているので、以前に出力したスナップショットも
+    そのまま使える。手で編集された場合などに備えて、読めなければ呼び出し側で補う。
+    """
+    if not snapshot:
+        return None
+    raw = (snapshot.get("period") or {}).get("from")
+    try:
+        return date.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def _weekly3_name(name: str | None) -> str:
