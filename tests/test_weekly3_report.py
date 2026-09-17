@@ -19,10 +19,11 @@ import backlog_weekly_report as bwr
 from tests.report_fixtures import PERIOD_END, PERIOD_START, basic_data, issue
 
 
-def make(prev_snapshot=None, reason="", data=None, name="バグ対応", conditions=None):
+def make(prev_snapshot=None, reason="", data=None, name="バグ対応", conditions=None,
+         url_base=""):
     return bwr.generate_weekly3_report(
         [(name, data or basic_data())], "PRJ", "テストプロジェクト",
-        PERIOD_START, PERIOD_END, prev_snapshot, reason, conditions,
+        PERIOD_START, PERIOD_END, prev_snapshot, reason, conditions, url_base,
     )
 
 
@@ -204,6 +205,67 @@ def test_filterless_run_is_labeled():
 
 
 # ==================================================================
+# 課題番号のリンク
+# ==================================================================
+
+SPACE = "https://example.backlog.jp"
+
+
+def test_issue_keys_are_links_in_every_column():
+    """今週・来週の予定に出る課題番号が、Backlog の課題ページへのリンクになること"""
+    text = make(url_base=SPACE)
+    for column in ("## 今週", "## 来週の予定"):
+        body = text.split(column)[1].split("\n## ")[0]
+        assert f"- [PRJ-10]({SPACE}/view/PRJ-10)｜" in body
+
+
+def test_issue_keys_are_links_in_previous_column():
+    """前週の列（スナップショットから復元した課題）もリンクにすること"""
+    snap = prev_snapshot(
+        counts={k: 1 for k in bwr.CATEGORY_KEYS},
+        incomplete=[{"id": 7, "issueKey": "PRJ-7", "summary": "残り",
+                     "status": "処理中", "dueDate": None}],
+    )
+    column = make(prev_snapshot=snap, url_base=SPACE) \
+        .split("## 前週")[1].split("## 今週")[0]
+
+    assert f"- [PRJ-7]({SPACE}/view/PRJ-7)｜" in column
+
+
+def test_notice_issue_keys_are_links():
+    """トピックスの注意書きに並ぶ課題番号もリンクにすること"""
+    data = basic_data()
+    data["inflow"] = [issue(11, "入ってきた課題", "未対応")]
+    topics = make(data=data, url_base=SPACE).split("## トピックス")[1].split("## 前週")[0]
+
+    assert f"[PRJ-11]({SPACE}/view/PRJ-11)" in topics
+
+
+def test_issue_keys_stay_plain_without_url_base():
+    """スペースの URL が分からないときは、これまでどおり課題番号のまま出すこと"""
+    body = make().split("## 今週")[1].split("\n## ")[0]
+    assert "- PRJ-10｜" in body
+    assert "](" not in body
+
+
+def test_issue_link_skips_placeholder_keys():
+    """課題番号が取れなかった場合にリンクを作らないこと"""
+    assert bwr._issue_link("-", SPACE) == "-"
+    assert bwr._issue_link("", SPACE) == ""
+    assert bwr._issue_link("PRJ-1", "") == "PRJ-1"
+
+
+def test_issue_link_trims_trailing_slash():
+    assert bwr._issue_link("PRJ-1", SPACE + "/") == f"[PRJ-1]({SPACE}/view/PRJ-1)"
+
+
+def test_summary_report_keeps_plain_issue_keys():
+    """Excel 貼り付け用のサマリーはこれまでどおり（リンクにしない）"""
+    from tests.report_fixtures import make_summary
+    assert "](" not in make_summary()
+
+
+# ==================================================================
 # docmold での変換（docmold が使える環境でのみ実行）
 # ==================================================================
 
@@ -219,7 +281,7 @@ def test_docmold_converts_without_warnings(tmp_path):
     取りこぼしは --strict の終了コードで分かる。
     """
     source = tmp_path / "weekly3_report.md"
-    source.write_text(make(), encoding="utf-8")
+    source.write_text(make(url_base=SPACE), encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(DOCMOLD), str(source), "-o", str(tmp_path / "out"), "--strict"],
@@ -239,6 +301,12 @@ def test_docmold_converts_without_warnings(tmp_path):
     ]
     assert "dm-entry__key" in body     # 課題がカードになっている
     assert "dm-count__label" in body   # 件数がチップになっている
+    # 課題番号のリンクが、カードの見出し欄の中に残っていること
+    # （entry_card は欄を文字列のところだけで区切るため、リンクは消えない）
+    assert re.search(
+        r'dm-entry__key[^>]*><a href="https://example\.backlog\.jp/view/PRJ-10">PRJ-10</a>',
+        body,
+    ), body
 
 
 # ==================================================================

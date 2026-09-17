@@ -170,6 +170,8 @@ class BacklogClient:
         # base_path の前後スラッシュを正規化（例: "/backlog/" → "/backlog"）
         base_path = "/" + base_path.strip("/") if base_path.strip("/") else ""
         self.base_url = f"https://{space_host}{base_path}/api/v2"
+        # 課題ページの URL（レポートのリンクに使う）。API ではなく画面側のパス。
+        self.web_url = f"https://{space_host}{base_path}"
         self.api_key = api_key
         self.debug = debug
         # SSL検証を無効にする場合のコンテキスト
@@ -1115,9 +1117,9 @@ def format_issue_table(issues: list, max_display: int = TABLE_MAX_DISPLAY) -> st
     return "\n".join(lines) + "\n"
 
 
-def keys_str(issues: list) -> str:
-    """課題番号のみのコンパクト表示"""
-    keys = [i.get("issueKey", "?") for i in issues]
+def keys_str(issues: list, url_base: str = "") -> str:
+    """課題番号のみのコンパクト表示（`url_base` があれば Backlog へのリンクにする）"""
+    keys = [_issue_link(i.get("issueKey", "?"), url_base) for i in issues]
     if not keys:
         return "_（なし）_"
     return "、".join(keys[:KEYS_MAX_DISPLAY]) + (
@@ -1276,9 +1278,24 @@ def generate_markdown_report(
     return "\n".join(lines)
 
 
-def _weekly3_entry(issue: dict) -> str:
-    """weekly3 のカード 1 件（`課題番号｜期限：m/d｜ステータス｜件名`）"""
-    key = issue.get("issueKey", "-")
+def _issue_link(key: str, url_base: str = "") -> str:
+    """課題番号を Backlog の課題ページへのリンクにする。
+
+    `url_base` が空（スペースが分からない場合）や課題番号が無い場合は、
+    そのままの文字列を返す。
+    """
+    if not url_base or not key or key in ("-", "?"):
+        return key
+    return f"[{key}]({url_base.rstrip('/')}/view/{urllib.parse.quote(key)})"
+
+
+def _weekly3_entry(issue: dict, url_base: str = "") -> str:
+    """weekly3 のカード 1 件（`課題番号｜期限：m/d｜ステータス｜件名`）
+
+    課題番号は Markdown のリンクにする。docmold の `entry_card` は欄を文字列の
+    ところだけで区切るため、欄の中のリンクはそのまま残る。
+    """
+    key = _issue_link(issue.get("issueKey", "-"), url_base)
     status = issue.get("status", {}).get("name", "-")
     summary = (issue.get("summary") or "-").replace("｜", "／")
     return f"- {key}｜期限：{_fmt_due(issue.get('dueDate'))}｜{status}｜{summary}"
@@ -1290,7 +1307,7 @@ def _weekly3_counts(counts: dict) -> str:
                       for key, label in zip(CATEGORY_KEYS, CATEGORY_LABELS, strict=True))
 
 
-def _weekly3_column(entries: list, note: str = "") -> list:
+def _weekly3_column(entries: list, note: str = "", url_base: str = "") -> list:
     """
     1 列ぶんの本文を組み立てる。
 
@@ -1309,12 +1326,12 @@ def _weekly3_column(entries: list, note: str = "") -> list:
             lines += [f"_（{entry_note}）_", ""]
             continue
         lines += [_weekly3_counts(counts), ""]
-        lines += [_weekly3_entry(i) for i in issues] if issues else ["_（該当なし）_"]
+        lines += [_weekly3_entry(i, url_base) for i in issues] if issues else ["_（該当なし）_"]
         lines.append("")
     return lines
 
 
-def _weekly3_plan_column(entries: list, next_start: date) -> list:
+def _weekly3_plan_column(entries: list, next_start: date, url_base: str = "") -> list:
     """
     「来週の予定」の列。⑤ をそのまま持ち越し、期限を過ぎているものを数える。
 
@@ -1330,7 +1347,8 @@ def _weekly3_plan_column(entries: list, next_start: date) -> list:
                   f"予定:{len(issues)} / 期限切れ:{len(overdue)}", ""]
         if issues:
             overdue_ids = {i.get("id") for i in overdue}
-            lines += [_weekly3_entry(_with_status(i, "期限超過") if i.get("id") in overdue_ids else i)
+            lines += [_weekly3_entry(_with_status(i, "期限超過") if i.get("id") in overdue_ids else i,
+                                     url_base)
                       for i in issues]
         else:
             lines.append("_（該当なし）_")
@@ -1347,6 +1365,7 @@ def generate_weekly3_report(
     prev_snapshot: dict | None,
     snapshot_reason: str = "",
     conditions: dict | None = None,
+    url_base: str = "",
 ) -> str:
     """
     docmold の `weekly3` に渡す Markdown を組み立てる。
@@ -1359,6 +1378,9 @@ def generate_weekly3_report(
 
     conditions: {分類名: 今回の絞り込み条件}。前回と違う分類は、数えている対象が
     違うため前週の列に数字を出さない。
+
+    url_base: Backlog のスペースの URL（`https://example.backlog.jp`）。
+    渡すと課題番号を課題ページへのリンクにする。
     """
     length = (period_end - period_start).days + 1
     prev_end = period_start - timedelta(days=1)
@@ -1423,25 +1445,26 @@ def generate_weekly3_report(
         lines.append(f"| {_weekly3_name(name)} | {' | '.join(counts)} |")
     lines.append("")
 
-    notices = _weekly3_notices(all_filter_data)
+    notices = _weekly3_notices(all_filter_data, url_base)
     if notices:
         lines += ["### 注意", ""] + notices + [""]
 
     lines += [f"## 前週（{span(prev_start, prev_end)}）", ""]
-    lines += _weekly3_column(prev_entries, prev_note)
+    lines += _weekly3_column(prev_entries, prev_note, url_base)
 
     lines += [f"## 今週（{span(period_start, period_end)}）", ""]
     lines += _weekly3_column([
         (_weekly3_name(name), {key: len(data[key]) for key in CATEGORY_KEYS},
          sorted(data["completed"] + data["incomplete"], key=_issue_sort_key), "")
         for name, data in all_filter_data
-    ])
+    ], "", url_base)
 
     lines += [f"## 来週の予定（{span(next_start, next_end)}）", ""]
     lines += _weekly3_plan_column(
         [(_weekly3_name(name), sorted(data["incomplete"], key=_issue_sort_key))
          for name, data in all_filter_data],
         next_start,
+        url_base,
     )
 
     return "\n".join(lines).rstrip("\n") + "\n"
@@ -1481,17 +1504,17 @@ def _from_snapshot_entry(saved: dict) -> dict:
     }
 
 
-def _weekly3_notices(all_filter_data: list) -> list:
+def _weekly3_notices(all_filter_data: list, url_base: str = "") -> list:
     """トピックスに載せる注意書き（該当がなければ空）"""
     lines: list = []
     for name, data in all_filter_data:
         label = _weekly3_name(name)
         if data.get("inflow"):
             lines.append(f"- {label}: 期間中に対象へ入った {len(data['inflow'])} 件を "
-                         f"② 新規発生に含めた（{keys_str(data['inflow'])}）")
+                         f"② 新規発生に含めた（{keys_str(data['inflow'], url_base)}）")
         if data.get("outflow"):
             lines.append(f"- {label}: 期間中に対象から外れた {len(data['outflow'])} 件を "
-                         f"④ 当週完了に含めた（{keys_str(data['outflow'])}）")
+                         f"④ 当週完了に含めた（{keys_str(data['outflow'], url_base)}）")
         if data.get("comment_failures"):
             lines.append(f"- {label}: {len(data['comment_failures'])} 件の課題で"
                          "コメント履歴を取得できなかった")
@@ -1981,6 +2004,7 @@ def run(argv: list | None = None) -> None:
         all_filter_data, project_key, projects.get(project_key)["name"],
         period_start, period_end, prev_snapshot, snapshot_reason,
         conditions={name: condition for name, condition, _ in snapshot_entries},
+        url_base=client.web_url,
     )
     weekly3_path = output_dir / "weekly3_report.md"
     weekly3_path.write_text(weekly3_md, encoding="utf-8")
