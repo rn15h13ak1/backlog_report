@@ -67,6 +67,13 @@ def test_base_url_normalizes_base_path():
     assert BacklogClient("h", "k", base_path="backlog").base_url == "https://h/backlog/api/v2"
 
 
+def test_web_url_includes_base_path():
+    """レポートのリンクに使う課題ページの URL。オンプレミス版では base_path の下に入る"""
+    assert BacklogClient("h", "k").web_url == "https://h"
+    assert BacklogClient("h", "k", base_path="/backlog/").web_url == "https://h/backlog"
+    assert BacklogClient("h", "k", base_path="backlog").web_url == "https://h/backlog"
+
+
 def test_list_params_use_percent_encoded_brackets(client):
     url, _ = client._build_url("/issues", {"statusId": [1, 2]})
     assert "statusId%5B%5D=1" in url

@@ -163,6 +163,33 @@ def test_run_creates_period_directory_from_args(tmp_path, stub):
     assert not (out / PERIOD_DIR).exists()   # config の period は引数に負ける
 
 
+def test_weekly3_links_use_configured_space(tmp_path, stub):
+    """weekly3 の課題番号のリンクが、設定した接続先から組み立てられること"""
+    stub()
+    out = tmp_path / "out"
+    config = write_config(tmp_path, out)
+
+    bwr.run(["--config", str(config)])
+
+    text = (out / PERIOD_DIR / "weekly3_report.md").read_text(encoding="utf-8")
+    assert "- [PRJ-1](https://example.backlog.com/view/PRJ-1)｜" in text
+
+
+def test_weekly3_links_include_base_path_on_premise(tmp_path, stub):
+    """オンプレミス版（base_path 付き）でも課題ページのリンクが正しく出ること"""
+    stub()
+    out = tmp_path / "out"
+    config = write_config(tmp_path, out)
+    loaded = yaml.safe_load(config.read_text(encoding="utf-8"))
+    loaded["backlog"]["base_path"] = "/backlog"
+    config.write_text(yaml.safe_dump(loaded, allow_unicode=True), encoding="utf-8")
+
+    bwr.run(["--config", str(config)])
+
+    text = (out / PERIOD_DIR / "weekly3_report.md").read_text(encoding="utf-8")
+    assert "- [PRJ-1](https://example.backlog.com/backlog/view/PRJ-1)｜" in text
+
+
 # ==================================================================
 # フィルターあり
 # ==================================================================
