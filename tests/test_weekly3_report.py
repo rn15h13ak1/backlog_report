@@ -27,9 +27,11 @@ def make(prev_snapshot=None, reason="", data=None, name="バグ対応", conditio
     )
 
 
-def prev_snapshot(counts=None, completed=None, incomplete=None, name="バグ対応"):
+def prev_snapshot(counts=None, completed=None, incomplete=None, name="バグ対応",
+                  outflow=None):
     entry = {"name": name, "condition": "",
-             "completed": completed or [], "incomplete": incomplete or []}
+             "completed": completed or [], "incomplete": incomplete or [],
+             "outflow": outflow or []}
     if counts is not None:
         entry["counts"] = counts
     return {"version": bwr.SNAPSHOT_VERSION,
@@ -259,6 +261,68 @@ def test_issue_link_trims_trailing_slash():
     assert bwr._issue_link("PRJ-1", SPACE + "/") == f"[PRJ-1]({SPACE}/view/PRJ-1)"
 
 
+# ==================================================================
+# 抽出対象から外れた課題の印
+# ==================================================================
+
+def test_outflow_issue_is_labeled_in_this_week_column():
+    """
+    対象から外れて④に入れた課題は、記録されていたステータスのままだと
+    「未対応なのに完了に数えられている」ように見えるため、印を付けること。
+    """
+    left = issue(3, "対象外になった課題", "未対応")
+    data = basic_data()
+    data["carry_over"] = data["carry_over"] + [left]
+    data["completed"] = data["completed"] + [left]
+    data["outflow"] = [left]
+
+    body = make(data=data).split("## 今週")[1].split("\n## ")[0]
+
+    assert "- PRJ-3｜期限：なし｜完了扱い｜対象外になった｜対象外になった課題" in body
+    # 対象から外れていない課題はこれまでどおり
+    assert "- PRJ-2｜期限：3/10｜完了｜残っている課題" in body
+
+
+def test_outflow_label_is_not_applied_to_other_issues():
+    body = make().split("## 今週")[1].split("\n## ")[0]
+    assert "完了扱い" not in body
+
+
+def test_outflow_issue_is_labeled_in_previous_column():
+    """前週の列（スナップショットから復元）でも同じ印を付けること"""
+    saved = {"id": 9, "issueKey": "PRJ-9", "summary": "外れた課題",
+             "status": "処理中", "dueDate": None}
+    snap = prev_snapshot(counts={k: 1 for k in bwr.CATEGORY_KEYS},
+                         completed=[saved], outflow=[9])
+
+    column = make(prev_snapshot=snap).split("## 前週")[1].split("## 今週")[0]
+
+    assert "- PRJ-9｜期限：なし｜完了扱い｜対象外になった｜外れた課題" in column
+
+
+def test_previous_column_without_outflow_key_still_works():
+    """outflow を持たない以前の形式のスナップショットでも読めること"""
+    saved = {"id": 9, "issueKey": "PRJ-9", "summary": "完了した課題",
+             "status": "完了", "dueDate": None}
+    snap = prev_snapshot(counts={k: 1 for k in bwr.CATEGORY_KEYS}, completed=[saved])
+    del snap["filters"][0]["outflow"]
+
+    column = make(prev_snapshot=snap).split("## 前週")[1].split("## 今週")[0]
+
+    assert "- PRJ-9｜期限：なし｜完了｜完了した課題" in column
+
+
+def test_outflow_issue_keeps_its_link():
+    left = issue(3, "対象外になった課題", "未対応")
+    data = basic_data()
+    data["completed"] = data["completed"] + [left]
+    data["outflow"] = [left]
+
+    body = make(data=data, url_base=SPACE).split("## 今週")[1].split("\n## ")[0]
+
+    assert f"- [PRJ-3]({SPACE}/view/PRJ-3)｜期限：なし｜完了扱い｜対象外になった｜" in body
+
+
 def test_summary_report_keeps_plain_issue_keys():
     """Excel 貼り付け用のサマリーはこれまでどおり（リンクにしない）"""
     from tests.report_fixtures import make_summary
@@ -280,8 +344,13 @@ def test_docmold_converts_without_warnings(tmp_path):
     見出し 2 の数が 4 つでない、front matter のキーを間違えている、といった
     取りこぼしは --strict の終了コードで分かる。
     """
+    left = issue(3, "対象外になった課題", "未対応")
+    data = basic_data()
+    data["completed"] = data["completed"] + [left]
+    data["outflow"] = [left]
+
     source = tmp_path / "weekly3_report.md"
-    source.write_text(make(url_base=SPACE), encoding="utf-8")
+    source.write_text(make(data=data, url_base=SPACE), encoding="utf-8")
 
     result = subprocess.run(
         [sys.executable, str(DOCMOLD), str(source), "-o", str(tmp_path / "out"), "--strict"],
@@ -305,6 +374,13 @@ def test_docmold_converts_without_warnings(tmp_path):
     # （entry_card は欄を文字列のところだけで区切るため、リンクは消えない）
     assert re.search(
         r'dm-entry__key[^>]*><a href="https://example\.backlog\.jp/view/PRJ-10">PRJ-10</a>',
+        body,
+    ), body
+    # 対象から外れた課題は「完了扱い」のバッジと、理由の欄になる
+    # （理由の文言に「未対応」などを混ぜると、そちらがバッジとして拾われてしまう）
+    assert re.search(
+        r'<span class="dm-badge dm-badge--ok">完了扱い</span>'
+        r'<span class="dm-entry__meta">対象外になった</span>',
         body,
     ), body
 

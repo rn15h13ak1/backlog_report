@@ -204,6 +204,31 @@ def test_inflow_and_outflow_are_reflected_in_the_chain(tmp_path, monkeypatch):
     assert "PRJ-7" not in read_snapshot_incomplete(out, 2)
 
 
+def test_outflow_is_labeled_in_weekly3_and_recorded_in_snapshot(tmp_path, monkeypatch):
+    """
+    流出した課題が weekly3 で「対象外になった」と分かること。
+
+    ④に入っているのに記録上のステータスは未完了のままなので、印が無いと
+    「未対応なのに完了に数えられている」ように見える。
+    次回の「前週」の列でも同じ印を付けられるよう、課題 ID を記録する。
+    """
+    out = tmp_path / "out"
+    scenarios = scenarios_with_flows()
+    for week in range(3):
+        run_week(monkeypatch, tmp_path, out, scenarios, week)
+
+    period = out / period_dir(WEEKS[2])
+    md = (period / "weekly3_report.md").read_text(encoding="utf-8")
+    card = next(ln for ln in md.split("## 今週")[1].split("\n## ")[0].splitlines()
+                if "PRJ-7" in ln)
+    assert "｜完了扱い｜対象外になった｜" in card
+
+    snap = json.loads((period / bwr.SNAPSHOT_FILENAME).read_text(encoding="utf-8"))
+    outflow = snap["filters"][0]["outflow"]
+    assert [i["issueKey"] for i in snap["filters"][0]["completed"] if i["id"] in outflow] \
+        == ["PRJ-7"]
+
+
 def test_completed_then_reopened_stays_incomplete(tmp_path, monkeypatch):
     """同じ週に完了して再オープンした課題は④ではなく⑤に入り、翌週①へ引き継がれること"""
     out = tmp_path / "out"

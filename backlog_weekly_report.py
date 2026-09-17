@@ -717,7 +717,7 @@ def build_snapshot(period_start: date, period_end: date, entries: list) -> dict:
     entries: [(フィルター名, 絞り込み条件の文字列, 集計結果)] のリスト。
 
     incomplete（⑤）は次回の①と突き合わせて出入りを判定するために使う。
-    counts と completed（④）は、次回の weekly3 レポートで「前週」の列を
+    counts と completed（④）と outflow は、次回の weekly3 レポートで「前週」の列を
     組み立てるために使う。読む側は欠けていても動くので、これらを足しても
     以前の形式のスナップショットはそのまま使える。
     """
@@ -734,6 +734,9 @@ def build_snapshot(period_start: date, period_end: date, entries: list) -> dict:
                 "counts": {key: len(data[key]) for key in CATEGORY_KEYS},
                 "completed":  [_snapshot_entry(i) for i in data["completed"]],
                 "incomplete": [_snapshot_entry(i) for i in data["incomplete"]],
+                # 抽出対象から外れて④に入れた課題。次回の weekly3 で「前週」の列に
+                # 出すときに、完了させたものと区別して印を付けるために使う。
+                "outflow": [i.get("id") for i in (data.get("outflow") or [])],
             }
             for name, condition, data in entries
         ],
@@ -1289,16 +1292,38 @@ def _issue_link(key: str, url_base: str = "") -> str:
     return f"[{key}]({url_base.rstrip('/')}/view/{urllib.parse.quote(key)})"
 
 
+#: 抽出対象から外れて④に入れた課題の、ステータス欄と理由の欄。
+#: 「完了扱い」は docmold で完了のバッジになり、理由はバッジにならない語を選ぶ
+#: （「未対応」などを含む文言にすると、そちらがバッジとして拾われてしまう）。
+OUTFLOW_STATUS = "完了扱い"
+OUTFLOW_NOTE = "対象外になった"
+
+
 def _weekly3_entry(issue: dict, url_base: str = "") -> str:
     """weekly3 のカード 1 件（`課題番号｜期限：m/d｜ステータス｜件名`）
 
     課題番号は Markdown のリンクにする。docmold の `entry_card` は欄を文字列の
     ところだけで区切るため、欄の中のリンクはそのまま残る。
+
+    抽出対象から外れて④に入れた課題は、ステータスを「完了扱い」に差し替えて
+    理由の欄を足す（`課題番号｜期限｜完了扱い｜対象外になった｜件名`）。
+    記録されていたステータス（「未対応」など）のまま完了として数えると、
+    なぜ完了なのかが分からないため。
     """
     key = _issue_link(issue.get("issueKey", "-"), url_base)
     status = issue.get("status", {}).get("name", "-")
     summary = (issue.get("summary") or "-").replace("｜", "／")
-    return f"- {key}｜期限：{_fmt_due(issue.get('dueDate'))}｜{status}｜{summary}"
+    note = f"{OUTFLOW_NOTE}｜" if issue.get("_outflow") else ""
+    if issue.get("_outflow"):
+        status = OUTFLOW_STATUS
+    return f"- {key}｜期限：{_fmt_due(issue.get('dueDate'))}｜{status}｜{note}{summary}"
+
+
+def _mark_outflow(issues: list, outflow_ids: set) -> list:
+    """抽出対象から外れた課題に印を付ける（表示のときだけ使う）"""
+    if not outflow_ids:
+        return issues
+    return [{**i, "_outflow": True} if i.get("id") in outflow_ids else i for i in issues]
 
 
 def _weekly3_counts(counts: dict) -> str:
@@ -1419,7 +1444,10 @@ def generate_weekly3_report(
             issues = (entry.get("completed") or []) + (entry.get("incomplete") or [])
             prev_entries.append((
                 _weekly3_name(name), counts,
-                sorted((_from_snapshot_entry(i) for i in issues), key=_issue_sort_key),
+                _mark_outflow(
+                    sorted((_from_snapshot_entry(i) for i in issues), key=_issue_sort_key),
+                    set(entry.get("outflow") or []),
+                ),
                 "",
             ))
 
@@ -1455,7 +1483,8 @@ def generate_weekly3_report(
     lines += [f"## 今週（{span(period_start, period_end)}）", ""]
     lines += _weekly3_column([
         (_weekly3_name(name), {key: len(data[key]) for key in CATEGORY_KEYS},
-         sorted(data["completed"] + data["incomplete"], key=_issue_sort_key), "")
+         _mark_outflow(sorted(data["completed"] + data["incomplete"], key=_issue_sort_key),
+                       {i.get("id") for i in (data.get("outflow") or [])}), "")
         for name, data in all_filter_data
     ], "", url_base)
 
