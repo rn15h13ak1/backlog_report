@@ -1,4 +1,29 @@
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+*.swp
+*~
+
+# mac-watcher トリガー・ログ
+.build-trigger
+.build-output.log
+.git-trigger
 .git-output.log
+.github-trigger
+
+# 資格情報
+.env
+.env.*
+secrets.yaml
+credentials*
+*.pem
+*.key
+*.local.yaml
+
+# 設定の実体（API キーを含む）
 config.yaml
 
 # 生成物
@@ -11,9 +36,6 @@ __pycache__/
 venv/
 .pytest_cache/
 .ruff_cache/
-
-# Claude Code の作業ディレクトリ（git worktree を含む）
-.claude/
 
 # カバレッジ計測の出力
 .coverage
