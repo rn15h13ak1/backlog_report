@@ -7,6 +7,7 @@ weekly3 は「見出し 2 を 4 つ置き、1 つ目をトピックス、2〜4 �
 列の見出しには期間を自分で書き込む。docmold の column_periods は見出しに区切り（〜）が
 あれば触らないため、7 日以外の期間でも正しい範囲が出る。
 """
+import os
 import re
 import subprocess
 import sys
@@ -336,7 +337,10 @@ def test_summary_report_keeps_plain_issue_keys():
 # docmold での変換（docmold が使える環境でのみ実行）
 # ==================================================================
 
-DOCMOLD = Path.home() / "ws" / "docmold" / "docmold.py"
+# docmold はリポジトリの兄弟ディレクトリに置かれている前提。別の場所に置く場合は
+# 環境変数 DOCMOLD_HOME で上書きする（絶対パスを書かないための決まり）。
+DOCMOLD = Path(os.environ.get("DOCMOLD_HOME")
+               or Path(__file__).resolve().parents[2] / "docmold") / "docmold.py"
 
 
 @pytest.mark.skipif(not DOCMOLD.exists(), reason="docmold が無い")

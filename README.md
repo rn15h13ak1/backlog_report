@@ -293,11 +293,11 @@ reports/
 `summary_report.md` は全フィルターの件数と、完了・未完了の課題一覧をまとめたものです。
 Excel へコピー＆ペーストして使う想定の形式になっています。
 
-`weekly3_report.md` は [docmold](https://github.com/rn15h13ak1/docmold) の `weekly3` に
+`weekly3_report.md` は docmold（リポジトリの兄弟ディレクトリ `../docmold/`）の `weekly3` に
 渡すための Markdown です。前週・今週・来週の予定を 3 列に並べた HTML に変換できます。
 
 ```bash
-python ~/ws/docmold/docmold.py reports/20260316_20260322/weekly3_report.md
+python ../docmold/docmold.py reports/20260316_20260322/weekly3_report.md
 ```
 
 - 真ん中の列が今回の集計、左が前回（`snapshot.json` から復元）、右が⑤の持ち越しです
@@ -413,7 +413,8 @@ python -m pytest tests/ -v
 - 旧実装との差分比較（`tests/_legacy.py` と突き合わせ、合成データ832ケース）
 - 抽出対象への出入り（流入が②に、流出が④に入ること、条件変更時は判定しないこと）
 - weekly3 用 Markdown の形式（見出しの数と並び、列の期間、件数と課題カードの書式）と、
-  docmold で警告なく変換できること
+  docmold で警告なく変換できること（`../docmold/` が無ければ読み飛ばします。
+  別の場所に置いている場合は環境変数 `DOCMOLD_HOME` で指定します）
 - 週を連鎖させた通し検証（3週続けて実行し、毎週 `前週⑤ = 今週①` と等式が成立すること、
   実行順を変えても⑤が変わらないこと、各カテゴリの表示ステータスの基準）
 - 設定の読み込みからファイル書き出しまでの通し実行（HTTP 通信だけを差し替え、
