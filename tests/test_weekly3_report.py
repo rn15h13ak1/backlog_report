@@ -54,7 +54,8 @@ def test_front_matter_declares_weekly3():
     head = text.split("---\n")[1]
     assert "type: weekly3" in head
     assert "title: テストプロジェクト 課題サマリー" in head
-    assert "期間: 2026-03-02 〜 2026-03-08" in head
+    # 曜日を添える（docmold が期間を組み立てる場合と同じ見え方にする）
+    assert "期間: 2026-03-02(月) 〜 2026-03-08(日)" in head
 
 
 def test_has_exactly_four_level2_headings():
@@ -65,7 +66,8 @@ def test_has_exactly_four_level2_headings():
 def test_first_heading_is_topics_and_rest_are_periods():
     first, *columns = headings(make())
     assert first == "トピックス"
-    assert columns == ["前週（2/23〜3/1）", "今週（3/2〜3/8）", "来週の予定（3/9〜3/15）"]
+    assert columns == ["前週（2/23(月)〜3/1(日)）", "今週（3/2(月)〜3/8(日)）",
+                       "来週の予定（3/9(月)〜3/15(日)）"]
 
 
 def test_column_periods_follow_the_period_length():
@@ -76,7 +78,8 @@ def test_column_periods_follow_the_period_length():
         None, "",
     )
     _, *columns = headings(text)
-    assert columns == ["前週（2/27〜3/1）", "今週（3/2〜3/4）", "来週の予定（3/5〜3/7）"]
+    assert columns == ["前週（2/27(金)〜3/1(日)）", "今週（3/2(月)〜3/4(水)）",
+                       "来週の予定（3/5(木)〜3/7(土)）"]
 
 
 def test_topics_has_a_level3_heading():
@@ -366,7 +369,8 @@ def test_docmold_converts_without_warnings(tmp_path):
     # 分類ごとにまとまり、その中に 3 つの期間が列として並ぶ
     assert re.findall(r'dm-group__title[^>]*>(.*?)</', body) == ["バグ対応"]
     assert sorted(set(re.findall(r'dm-column__title[^>]*>(.*?)</', body))) == [
-        "今週（3/2〜3/8）", "前週（2/23〜3/1）", "来週の予定（3/9〜3/15）",
+        "今週（3/2(月)〜3/8(日)）", "前週（2/23(月)〜3/1(日)）",
+        "来週の予定（3/9(月)〜3/15(日)）",
     ]
     assert "dm-entry__key" in body     # 課題がカードになっている
     assert "dm-count__label" in body   # 件数がチップになっている
@@ -398,7 +402,7 @@ def test_previous_heading_uses_the_recorded_period():
     snap = prev_snapshot(counts={k: 0 for k in bwr.CATEGORY_KEYS})
     snap["period"] = {"from": "2026-02-27", "to": "2026-03-01"}   # 3 日間
     _, previous, *_ = headings(make(prev_snapshot=snap))          # 今回は 7 日間
-    assert previous == "前週（2/27〜3/1）"
+    assert previous == "前週（2/27(金)〜3/1(日)）"
 
 
 @pytest.mark.parametrize("period", [
@@ -416,12 +420,12 @@ def test_previous_heading_falls_back_when_period_is_unreadable(period):
     else:
         snap["period"] = period
     _, previous, *_ = headings(make(prev_snapshot=snap))
-    assert previous == "前週（2/23〜3/1）"
+    assert previous == "前週（2/23(月)〜3/1(日)）"
 
 
 def test_previous_heading_without_snapshot():
     _, previous, *_ = headings(make(reason="記録がありません"))
-    assert previous == "前週（2/23〜3/1）"
+    assert previous == "前週（2/23(月)〜3/1(日)）"
 
 
 def test_snapshot_period_start_is_readable_from_the_first_format():

@@ -1292,6 +1292,24 @@ def _issue_link(key: str, url_base: str = "") -> str:
     return f"[{key}]({url_base.rstrip('/')}/view/{urllib.parse.quote(key)})"
 
 
+#: 曜日の表記。date.weekday()（月曜が 0）の順。docmold と同じ並び。
+WEEKDAYS = "月火水木金土日"
+
+
+def _weekday(value: date) -> str:
+    return WEEKDAYS[value.weekday()]
+
+
+def _span(begin: date, end: date) -> str:
+    """列の見出しに書く期間（`3/2(月)〜3/8(日)`）
+
+    docmold は見出しに区切り（〜）があれば書き換えないため、当ツールが自分で
+    書き込む。docmold が組み立てる場合と同じ見え方になるよう曜日を添える。
+    """
+    return (f"{begin.month}/{begin.day}({_weekday(begin)})"
+            f"〜{end.month}/{end.day}({_weekday(end)})")
+
+
 #: 抽出対象から外れて④に入れた課題の、ステータス欄と理由の欄。
 #: 「完了扱い」は docmold で完了のバッジになり、理由はバッジにならない語を選ぶ
 #: （「未対応」などを含む文言にすると、そちらがバッジとして拾われてしまう）。
@@ -1413,7 +1431,7 @@ def generate_weekly3_report(
     # だった場合に見出しの範囲がずれる。読めない場合だけ今回の長さで補う。
     prev_start = _snapshot_period_start(prev_snapshot) or (period_start - timedelta(days=length))
     next_start, next_end = period_end + timedelta(days=1), period_end + timedelta(days=length)
-    span = "{0.month}/{0.day}〜{1.month}/{1.day}".format
+    span = _span
 
     # ---- 前週の列は前回のスナップショットから組み立てる ----
     conditions = conditions or {}
@@ -1455,7 +1473,8 @@ def generate_weekly3_report(
         "---",
         "type: weekly3",
         f"title: {project_name} 課題サマリー",
-        f"期間: {period_start.isoformat()} 〜 {period_end.isoformat()}",
+        f"期間: {period_start.isoformat()}({_weekday(period_start)})"
+        f" 〜 {period_end.isoformat()}({_weekday(period_end)})",
         "---",
         "",
         "## トピックス",
