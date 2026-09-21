@@ -34,7 +34,9 @@ testpaths = ["tests"]
 #   python -m pytest tests/ --cov --cov-report=term-missing   # 未到達行も表示
 #   python -m pytest tests/ --cov --cov-report=html           # htmlcov/index.html
 [tool.coverage.run]
-source = ["backlog_weekly_report"]
+# 入口と、実装のパッケージの両方を測る。入口だけにすると、分割後は 111 行しか
+# 測らない状態になる。
+source = ["backlog_weekly_report", "backlog_report"]
 
 [tool.coverage.report]
 show_missing = false

@@ -448,6 +448,7 @@ python -m mypy
 python -m pytest tests/ --cov
 ```
 
+入口（`backlog_weekly_report.py`）と実装（`backlog_report/`）の両方を測ります。
 未到達の行番号まで見る場合は `--cov-report=term-missing`、HTML で見る場合は
 `--cov-report=html` を付けます（`htmlcov/index.html` が生成されます）。
 
