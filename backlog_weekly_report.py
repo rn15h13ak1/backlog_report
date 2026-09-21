@@ -46,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple, TypedDict
 
 import yaml
 
@@ -80,6 +80,37 @@ CATEGORY_LABELS = ("残", "新規", "再オープン", "完了", "未完了")
 TABLE_MAX_DISPLAY = 30
 TABLE_MAX_DISPLAY_INCOMPLETE = 50
 KEYS_MAX_DISPLAY = 20
+
+
+class _ReportDataRequired(TypedDict):
+    """集計結果のうち、必ず入るもの。`collect_report_data` が組み立てる。"""
+
+    carry_over: list        # ① 前週残件
+    new_issues: list        # ② 新規発生
+    reopened:   list        # ③ 再オープン
+    completed:  list        # ④ 当週完了
+    incomplete: list        # ⑤ 当週未完了
+    unknown_statuses: set   # プロジェクトのステータス一覧に無い名前
+    comment_failures: set   # コメント履歴を取得できなかった課題 ID
+    population_ids:   set   # 今回の母集団（抽出対象への出入りの判定に使う）
+    inflow:  list           # 期間中に抽出対象へ入った課題（② に含める）
+    outflow: list           # 期間中に抽出対象から外れた課題（① と ④ に含める）
+
+
+class ReportData(_ReportDataRequired, total=False):
+    """
+    集計結果。
+
+    `flow_unavailable` は、抽出対象への出入りを判定できなかったときだけ入る
+    （初回実行、週を飛ばした、絞り込み条件を書き換えたなど）。必須と任意を
+    分けてあるのは、読む側が `data["..."]` と `data.get("...")` のどちらを
+    使うべきかを宣言から読み取れるようにするため（型検査では強制されない）。
+
+    Python 3.10 を対象にしているため、キーごとの NotRequired ではなく
+    total=False の継承で表す。
+    """
+
+    flow_unavailable: str
 
 
 # JST は UTC+9 なので、UTC のこの時刻以降は JST では翌日になる
@@ -251,14 +282,14 @@ class BacklogClient:
                   file=sys.stderr)
         time.sleep(delay)
 
-    def _get(self, endpoint: str, params: dict | None = None) -> dict | list:
+    def _get(self, endpoint: str, params: dict | None = None) -> Any:
         """
         GETリクエストを送信してJSONを返す。
 
         429 / 5xx / 接続エラーは指数バックオフで最大 API_MAX_RETRIES 回リトライする。
         最終的に失敗した場合は BacklogAPIError を送出する（プロセスは終了しない）。
         """
-        url, debug_parts = self._build_url(endpoint, params)
+        url, debug_parts = self._build_url(endpoint, params or {})
 
         if self.debug:
             print(f"  [DEBUG] {endpoint} ?" + "&".join(debug_parts), file=sys.stderr)
@@ -312,7 +343,7 @@ class BacklogClient:
         課題一覧を全件取得（ページネーション対応）
         Backlog APIは1回最大100件のため、自動的に繰り返し取得します。
         """
-        all_issues = []
+        all_issues: list = []
         offset = 0
 
         # 呼び出し元の dict を書き換えないようコピーする
@@ -815,7 +846,7 @@ def previous_incomplete(snapshot: dict | None, filter_name: str,
     return None, f"フィルター「{filter_name}」は前回の集計に含まれていません"
 
 
-def apply_population_flows(data: dict, prev_incomplete: dict) -> dict:
+def apply_population_flows(data: ReportData, prev_incomplete: dict) -> ReportData:
     """
     前回⑤と突き合わせて、抽出対象への出入りを集計に反映する。
 
@@ -934,7 +965,8 @@ def _fetch_target_issues(
     if not statuses:
         return client.get_issues(project_id, base)
 
-    non_closed_ids = [s["id"] for s in statuses if s["id"] not in closed_status_ids]
+    non_closed_ids: list | None = [s["id"] for s in statuses
+                                   if s["id"] not in closed_status_ids]
     if not non_closed_ids:
         # 全ステータスが完了系という設定。B だけで足りる。
         non_closed_ids = None
@@ -966,7 +998,7 @@ def collect_report_data(
     closed_status_ids: list,
     extra_params: dict | None = None,
     max_workers: int = DEFAULT_MAX_WORKERS,
-) -> dict:
+) -> ReportData:
     """
     週次レポートに必要なデータを集計する。
 
@@ -1131,7 +1163,7 @@ def keys_str(issues: list, url_base: str = "") -> str:
     )
 
 
-def _build_notice_lines(data: dict) -> list:
+def _build_notice_lines(data: ReportData) -> list:
     """
     サマリーの直下に置く注記を組み立てる。
 
@@ -1195,14 +1227,14 @@ def _build_notice_lines(data: dict) -> list:
 
 
 def generate_markdown_report(
-    data: dict,
+    data: ReportData,
     project_key: str,
     project_name: str,
     period_start: date,
     period_end: date,
-    filter_name: str = None,
-    filter_description: str = None,
-    filter_summary: str = None,
+    filter_name: str | None = None,
+    filter_description: str | None = None,
+    filter_summary: str | None = None,
 ) -> str:
     """Markdownレポートを生成"""
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
@@ -1349,8 +1381,9 @@ def _mark_outflow(issues: list, outflow_ids: set) -> list:
     return [{**i, "_outflow": True} if i.get("id") in outflow_ids else i for i in issues]
 
 
-def _weekly3_counts(counts: dict) -> str:
-    """件数の並び（count_summary が拾う形式）"""
+def _weekly3_counts(counts: dict | None) -> str:
+    """件数の並び（count_summary が拾う形式）。記録に無い区分は 0 とする。"""
+    counts = counts or {}
     return " / ".join(f"{label}:{counts.get(key, 0)}"
                       for key, label in zip(CATEGORY_KEYS, CATEGORY_LABELS, strict=True))
 
@@ -1930,8 +1963,8 @@ def build_jobs(filters_cfg: list, default_project_key: str) -> list:
     return jobs
 
 
-def _apply_flows(data: dict, snapshot: dict | None, filter_name: str,
-                 condition: str, snapshot_reason: str) -> dict:
+def _apply_flows(data: ReportData, snapshot: dict | None, filter_name: str,
+                 condition: str, snapshot_reason: str) -> ReportData:
     """前回⑤と突き合わせて抽出対象への出入りを反映する（できない場合はそのまま返す）"""
     prev, reason = previous_incomplete(snapshot, filter_name, condition)
     if prev is None:
@@ -1946,7 +1979,7 @@ def _apply_flows(data: dict, snapshot: dict | None, filter_name: str,
     return result
 
 
-def _print_summary(output_path: Path, data: dict) -> None:
+def _print_summary(output_path: Path, data: ReportData) -> None:
     print(f"  ✅ 保存: {output_path}")
     print(f"     ①前週残件: {len(data['carry_over'])} 件 / "
           f"②新規: {len(data['new_issues'])} 件 / "

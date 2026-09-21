@@ -118,7 +118,7 @@ Python 3.10 以上が必要です。
 pip install pyyaml
 ```
 
-開発用（テスト・Lint）を含めてインストールする場合:
+開発用（テスト・Lint・型検査）を含めてインストールする場合:
 
 ```bash
 pip install -e ".[dev]"
@@ -429,6 +429,19 @@ python -m pytest tests/ -v
   正常系と、設定不備・マスター取得失敗・コメント取得失敗などの異常系）
 - レポートの並び（①〜⑤の各節と出入りの注記が課題番号順であること）
 
+### 型の検査
+
+```bash
+python -m mypy
+```
+
+集計データは `ReportData` として形を宣言してあります。キー名の打ち間違い
+（`data["incomplte"]`）、値の型の取り違え、weekly3 の列の中身（`ColumnEntry`）を
+タプルのまま渡した場合を、実行する前に見つけられます。
+
+`flow_unavailable` のように「入らないことがあるキー」も宣言で分かれていますが、
+これを `.get` せずに読むことは型検査では止まりません（宣言を読んで判断します）。
+
 ### カバレッジの計測
 
 ```bash
@@ -464,7 +477,7 @@ backlog_report/
   ├── check_api.py               # API 接続診断スクリプト
   ├── config.example.yaml        # 設定ファイルのテンプレート（これをコピーして config.yaml を作成）
   ├── config.yaml                # 実際の設定ファイル（.gitignore で管理対象外）
-  ├── pyproject.toml             # 依存関係・pytest / ruff / カバレッジの設定
+  ├── pyproject.toml             # 依存関係・pytest / ruff / mypy / カバレッジの設定
   ├── CHANGELOG.md               # 変更履歴
   ├── CLAUDE.md                  # 共通規約への参照
   ├── tests/                     # 単体テスト
