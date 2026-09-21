@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import backlog_weekly_report as bwr
+from backlog_report import report as report_module
 from tests.report_fixtures import (
     FROZEN_NOW,
     PERIOD_END,
@@ -39,7 +40,7 @@ def frozen_clock(monkeypatch):
         def now(cls, tz=None):
             return FROZEN_NOW.replace(tzinfo=tz) if tz else FROZEN_NOW
 
-    monkeypatch.setattr(bwr, "datetime", FrozenDatetime)
+    monkeypatch.setattr(report_module, "datetime", FrozenDatetime)
 
 
 def read_golden(name: str) -> str:

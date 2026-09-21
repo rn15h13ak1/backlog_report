@@ -8,6 +8,7 @@ from datetime import date
 import pytest
 
 import backlog_weekly_report as bwr
+from backlog_report import client as client_module
 from backlog_weekly_report import BacklogAPIError, BacklogClient
 
 
@@ -37,7 +38,7 @@ def http_error(code: int, body: str = "", retry_after: str | None = None):
 @pytest.fixture
 def no_sleep(monkeypatch):
     """リトライ待機で実際に待たないようにする"""
-    monkeypatch.setattr(bwr.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(client_module.time, "sleep", lambda _s: None)
 
 
 @pytest.fixture
@@ -53,7 +54,7 @@ def patch_urlopen(monkeypatch, handler):
         calls.append(req.full_url)
         return handler(len(calls) - 1)
 
-    monkeypatch.setattr(bwr.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(client_module.urllib.request, "urlopen", fake_urlopen)
     return calls
 
 
@@ -263,7 +264,7 @@ def test_statuses_cached_per_project(client, monkeypatch, no_sleep):
 def record_sleeps(monkeypatch):
     """time.sleep に渡された秒数を記録する"""
     slept = []
-    monkeypatch.setattr(bwr.time, "sleep", slept.append)
+    monkeypatch.setattr(client_module.time, "sleep", slept.append)
     return slept
 
 

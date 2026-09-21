@@ -8,7 +8,7 @@
 from datetime import datetime
 from pathlib import Path
 
-import backlog_weekly_report as bwr
+from backlog_report import report as report_module
 from tests.report_fixtures import FROZEN_NOW, basic_data, make_report, make_summary
 
 GOLDEN_DIR = Path(__file__).parent / "golden"
@@ -21,7 +21,7 @@ class _FrozenDatetime(datetime):
 
 
 def main() -> None:
-    bwr.datetime = _FrozenDatetime
+    report_module.datetime = _FrozenDatetime
     GOLDEN_DIR.mkdir(exist_ok=True)
 
     files = {

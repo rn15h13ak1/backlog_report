@@ -17,6 +17,7 @@ from datetime import date, datetime
 import pytest
 
 import backlog_weekly_report as bwr
+from backlog_report import period as period_module
 
 # 基準日は 2026-03-05（木曜）
 TODAY = date(2026, 3, 5)
@@ -30,7 +31,7 @@ def frozen_today(monkeypatch):
         def now(cls, tz=None):
             return datetime(2026, 3, 5, 12, 0, tzinfo=tz)
 
-    monkeypatch.setattr(bwr, "datetime", FrozenDatetime)
+    monkeypatch.setattr(period_module, "datetime", FrozenDatetime)
 
 
 def resolve(argv: list, report_cfg: dict | None = None):

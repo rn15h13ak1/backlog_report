@@ -473,7 +473,15 @@ python -m tests.regen_golden
 
 ```
 backlog_report/
-  ├── backlog_weekly_report.py   # メインスクリプト
+  ├── backlog_weekly_report.py   # 入口（通しの処理）
+  ├── backlog_report/            # 実装
+  │     ├── core.py              # 定数・型・共通の小物
+  │     ├── client.py            # Backlog API クライアント
+  │     ├── period.py            # 集計期間の決定、設定と引数の読み取り
+  │     ├── collect.py           # ①〜⑤の集計
+  │     ├── snapshot.py          # 期間をまたいだ照合の記録と、抽出対象への出入り
+  │     ├── report.py            # 個別レポートと横断サマリー
+  │     └── weekly3.py           # docmold の weekly3 に渡す Markdown
   ├── check_api.py               # API 接続診断スクリプト
   ├── config.example.yaml        # 設定ファイルのテンプレート（これをコピーして config.yaml を作成）
   ├── config.yaml                # 実際の設定ファイル（.gitignore で管理対象外）

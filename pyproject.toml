@@ -20,10 +20,11 @@ dev = [
     "types-PyYAML",
 ]
 
-# パッケージではなく単一モジュールの構成のため、対象を明示する。
-# 指定しないと setuptools がトップレベルのモジュールを2つ見つけて自動判別を中止する。
+# 入口の 2 つのスクリプトと、実装のパッケージを対象にする。
+# 指定しないと setuptools がトップレベルのモジュールを複数見つけて自動判別を中止する。
 [tool.setuptools]
 py-modules = ["backlog_weekly_report", "check_api"]
+packages = ["backlog_report"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -49,7 +50,7 @@ exclude_lines = [
 #   python -m mypy backlog_weekly_report.py check_api.py
 [tool.mypy]
 python_version = "3.10"
-files = ["backlog_weekly_report.py", "check_api.py"]
+files = ["backlog_weekly_report.py", "check_api.py", "backlog_report"]
 # 注釈を付けていない関数の中身までは見ない（段階的に付けるため）。
 check_untyped_defs = true
 
