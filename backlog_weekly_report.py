@@ -20,75 +20,87 @@ Backlog 週次レポート生成ツール（入口）。
 import sys
 from pathlib import Path
 
-from backlog_report.client import (  # noqa: F401  （公開している名前）
-    BacklogAPIError,
-    BacklogClient,
-    ProjectInfoCache,
-    format_api_error,
-)
-from backlog_report.collect import (  # noqa: F401
-    _fetch_comments_bulk,
-    _fetch_target_issues,
-    build_filter_summary,
-    build_jobs,
-    classify_issue_from_comments,
-    collect_report_data,
-    resolve_filter_params,
-    validate_status_config,
-)
-from backlog_report.core import (  # noqa: F401
-    API_MAX_RETRIES,
-    API_PAGE_SIZE,
-    CATEGORY_KEYS,
-    CATEGORY_LABELS,
-    DEFAULT_CLOSED_STATUS_IDS,
-    DEFAULT_MAX_WORKERS,
-    JST,
-    KEYS_MAX_DISPLAY,
-    MAX_WORKERS_LIMIT,
-    RETRY_MAX_DELAY,
-    TABLE_MAX_DISPLAY,
-    TABLE_MAX_DISPLAY_INCOMPLETE,
-    ReportData,
-    _fmt_due,
-    _issue_sort_key,
-    safe_filename,
-    to_local_date,
-)
-from backlog_report.period import (  # noqa: F401
-    build_arg_parser,
-    get_week_range,
-    load_config,
-    resolve_max_workers,
-    resolve_period,
-    validate_backlog_config,
-)
-from backlog_report.report import (  # noqa: F401
-    _issue_link,
-    format_issue_table,
-    generate_markdown_report,
-    generate_summary_report,
-    keys_str,
-)
-from backlog_report.snapshot import (  # noqa: F401
-    NO_FILTER_NAME,
-    SNAPSHOT_FILENAME,
-    SNAPSHOT_VERSION,
-    _snapshot_entry,
-    apply_population_flows,
-    build_snapshot,
-    find_previous_snapshot,
-    previous_incomplete,
-    write_snapshot,
-)
-from backlog_report.weekly3 import (  # noqa: F401
-    NOTICE_TITLE,
-    ColumnEntry,
-    PlanEntry,
-    _snapshot_period_start,
-    _weekly3_column,
-    generate_weekly3_report,
-)
+#: 依存が入っていないときに案内するライブラリ。無関係な失敗は握り潰さない。
+_REQUIRED_PACKAGES = ("yaml",)
+
+try:
+    from backlog_report.client import (  # noqa: F401  （公開している名前）
+        BacklogAPIError,
+        BacklogClient,
+        ProjectInfoCache,
+        format_api_error,
+    )
+    from backlog_report.collect import (  # noqa: F401
+        _fetch_comments_bulk,
+        _fetch_target_issues,
+        build_filter_summary,
+        build_jobs,
+        classify_issue_from_comments,
+        collect_report_data,
+        resolve_filter_params,
+        validate_status_config,
+    )
+    from backlog_report.core import (  # noqa: F401
+        API_MAX_RETRIES,
+        API_PAGE_SIZE,
+        CATEGORY_KEYS,
+        CATEGORY_LABELS,
+        DEFAULT_CLOSED_STATUS_IDS,
+        DEFAULT_MAX_WORKERS,
+        JST,
+        KEYS_MAX_DISPLAY,
+        MAX_WORKERS_LIMIT,
+        RETRY_MAX_DELAY,
+        TABLE_MAX_DISPLAY,
+        TABLE_MAX_DISPLAY_INCOMPLETE,
+        ReportData,
+        _fmt_due,
+        _issue_sort_key,
+        safe_filename,
+        to_local_date,
+    )
+    from backlog_report.period import (  # noqa: F401
+        build_arg_parser,
+        get_week_range,
+        load_config,
+        resolve_max_workers,
+        resolve_period,
+        validate_backlog_config,
+    )
+    from backlog_report.report import (  # noqa: F401
+        _issue_link,
+        format_issue_table,
+        generate_markdown_report,
+        generate_summary_report,
+        keys_str,
+    )
+    from backlog_report.snapshot import (  # noqa: F401
+        NO_FILTER_NAME,
+        SNAPSHOT_FILENAME,
+        SNAPSHOT_VERSION,
+        _snapshot_entry,
+        apply_population_flows,
+        build_snapshot,
+        find_previous_snapshot,
+        previous_incomplete,
+        write_snapshot,
+    )
+    from backlog_report.weekly3 import (  # noqa: F401
+        NOTICE_TITLE,
+        ColumnEntry,
+        PlanEntry,
+        _snapshot_period_start,
+        _weekly3_column,
+        generate_weekly3_report,
+    )
+except ModuleNotFoundError as e:   # pragma: no cover  （素の環境でのみ通る）
+    if e.name not in _REQUIRED_PACKAGES:
+        raise
+    print(f"必要なライブラリ {e.name} が入っていません。", file=sys.stderr)
+    print(f"実行中の Python: {sys.executable}", file=sys.stderr)
+    print("次のコマンドでインストールしてください:", file=sys.stderr)
+    print("    pip install pyyaml", file=sys.stderr)
+    sys.exit(2)
 
 
 def _apply_flows(data: ReportData, snapshot: dict | None, filter_name: str,
