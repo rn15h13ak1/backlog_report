@@ -1253,7 +1253,7 @@ def generate_markdown_report(
         ("④ 当週完了", completed,
          f"{ws_str} 〜 {we_str} に完了した課題", TABLE_MAX_DISPLAY),
         ("⑤ 当週未完了", incomplete,
-         f"{we_str} 時点でオープン（未対応・処理中）の課題", TABLE_MAX_DISPLAY_INCOMPLETE),
+         f"{we_str} 時点で完了系でない（オープンな）課題", TABLE_MAX_DISPLAY_INCOMPLETE),
     ]
     for title, issues, description, max_display in sections:
         lines += [

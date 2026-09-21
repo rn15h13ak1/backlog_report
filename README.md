@@ -207,6 +207,14 @@ python backlog_weekly_report.py --week current
 python backlog_weekly_report.py --config /path/to/other_config.yaml
 ```
 
+**API リクエストの内容を確認する場合:**
+
+```bash
+python backlog_weekly_report.py --debug
+```
+
+送信したクエリと取得件数を標準エラーへ出力します（API キーは出力しません）。
+
 ---
 
 ## フィルター設定
@@ -388,7 +396,7 @@ python ../docmold/docmold.py reports/20260316_20260322/weekly3_report.md
 - **API エラーの扱い**: 429 / 5xx / 接続エラーは指数バックオフで最大 3 回リトライします。
   待ち時間には 0〜50% のばらつきを上乗せし、並列で動いているワーカーが同時に再送して
   再び衝突するのを防ぎます（サーバーが `Retry-After` で指示した秒数は下回りません）。
-  個別の課題でコメント履歴の取得に失敗しても処理は継続し、件数がレポート末尾と実行ログに警告表示されます。
+  個別の課題でコメント履歴の取得に失敗しても処理は継続し、件数がレポートのサマリー直下と実行ログに警告表示されます。
 - **オンプレミス版について**: `base_path`（例: `"/backlog"`）と `ssl_verify: false` を設定することでオンプレミス版にも対応しています。
 - **接続診断**: 設定が正しいか不安な場合は `python check_api.py` を実行してください。
   接続・認証、プロジェクト、ステータス分類、コメントの changeLog をまとめて確認できます。
@@ -457,6 +465,7 @@ backlog_report/
   ├── config.yaml                # 実際の設定ファイル（.gitignore で管理対象外）
   ├── pyproject.toml             # 依存関係・pytest / ruff / カバレッジの設定
   ├── CHANGELOG.md               # 変更履歴
+  ├── CLAUDE.md                  # 共通規約への参照
   ├── tests/                     # 単体テスト
   │     ├── golden/              # レポート出力の比較用ファイル
   │     └── _legacy.py           # 差分テスト用に凍結した旧実装
@@ -466,5 +475,6 @@ backlog_report/
         └── YYYYMMDD_YYYYMMDD/
               ├── weekly_report[_フィルター名].md
               ├── summary_report.md   # 全フィルターの横断サマリー（フィルターあり時のみ）
+              ├── weekly3_report.md   # docmold の weekly3 に渡す Markdown
               └── snapshot.json       # 次回照合用の記録
 ```
