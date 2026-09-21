@@ -150,6 +150,9 @@ def test_run_without_filters_writes_one_report(tmp_path, stub, capsys):
     assert "Backlog レポート生成" in stdout
     assert "対象期間    : 2026-03-02 〜 2026-03-08（指定期間（config） / JST基準）" in stdout
     assert "①前週残件: 2 件" in stdout
+    # 記録はフィルターの有無にかかわらず書き出し、保存したことを知らせる
+    assert (out / PERIOD_DIR / bwr.SNAPSHOT_FILENAME).exists()
+    assert "次回照合用の記録" in stdout
 
 
 def test_run_creates_period_directory_from_args(tmp_path, stub):
@@ -273,6 +276,37 @@ def test_run_treats_unlisted_status_as_open(tmp_path, stub, capsys):
     assert "| ① 前週残件数 | **3** 件 |" in text     # PRJ-1, PRJ-2 に PRJ-4 が加わる
     assert "レビュー中" in text
     assert "ステータス一覧に無い名前" not in capsys.readouterr().err
+
+
+def test_run_warns_when_changelog_has_a_renamed_status(tmp_path, stub, capsys):
+    """
+    changeLog に現在のステータス一覧に無い名前が現れたら、実行ログで知らせること。
+
+    ステータスを改名・削除すると過去の履歴には旧名が残る。気づかないと
+    オープン系として数え続けることになる。
+    """
+    # 期間中に更新された課題（PRJ-2）でないとコメントを取得しない
+    comments = {2: [{"id": 1, "created": "2026-03-04T02:00:00Z",
+                     "changeLog": [{"field": "status",
+                                    "originalValue": "旧ステータス", "newValue": "完了"}]}]}
+    stub(comments=comments)
+    config = write_config(tmp_path, tmp_path / "out")
+
+    bwr.run(["--config", str(config)])
+
+    err = capsys.readouterr().err
+    assert "ステータス一覧に無い名前: 旧ステータス" in err
+    assert "改名または削除された可能性があります" in err
+
+
+def test_status_validation_is_skipped_without_statuses():
+    """
+    ステータス一覧が取れなかった場合は検証しないこと。
+
+    先頭のステータス（新規作成時のもの）が分からず、判定のしようがない。
+    ここで止めると、一覧の取得だけが失敗したときに集計そのものができなくなる。
+    """
+    bwr.validate_status_config([], [1, 3, 4], "PRJ")   # 例外にならなければよい
 
 
 def test_run_rejects_initial_status_in_closed_ids(tmp_path, stub, capsys):

@@ -250,3 +250,28 @@ def test_month_and_year_rollover():
     assert to_local_date("2026-12-31T23:59:59Z") == "2027-01-01"
     assert to_local_date("2024-02-28T15:00:00Z") == "2024-02-29"   # うるう年
     assert to_local_date("2025-02-28T15:00:00Z") == "2025-03-01"   # 平年
+
+
+def test_non_status_changelog_entries_are_ignored():
+    """
+    ステータス以外の変更（担当者・期限など）はステータス変化として数えないこと。
+
+    1 つのコメントに複数の変更がまとまって記録されるため、field を見ずに読むと
+    期間中に変化したものとして扱ってしまう。
+    """
+    iss = issue("2026-01-10T02:00:00Z", status="処理中")
+    mixed = {
+        "id": 1,
+        "created": "2026-03-04T02:00:00Z",
+        "changeLog": [
+            {"field": "assigner", "originalValue": "山田", "newValue": "鈴木"},
+            {"field": "limitDate", "originalValue": "", "newValue": "2026-03-20"},
+        ],
+    }
+    result = classify(iss, [mixed])
+
+    assert result["status_at_start"] == "処理中"
+    assert result["status_at_end"] == "処理中"
+    assert result["is_completed"] is False
+    assert result["is_reopened"] is False
+    assert result["seen_statuses"] == {"処理中"}

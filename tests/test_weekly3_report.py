@@ -205,6 +205,21 @@ def test_no_notice_section_when_nothing_to_report():
     assert "### 注意" not in topics
 
 
+def test_column_shows_placeholder_without_any_filter_data():
+    """
+    分類が 1 つも無いときでも、列の形を保つこと。
+
+    docmold は見出し 2 を 4 つ置く前提で列に割り付けるため、中身が空でも
+    見出しと本文が要る。
+    """
+    text = bwr.generate_weekly3_report(
+        [], "PRJ", "テストプロジェクト", PERIOD_START, PERIOD_END, None, "",
+    )
+    assert len(headings(text)) == 4
+    for column in ("## 今週", "## 来週の予定"):
+        assert "_（対象なし）_" in text.split(column)[1].split("\n## ")[0]
+
+
 def test_filterless_run_is_labeled():
     text = make(name=None)
     assert "### 全課題" in text

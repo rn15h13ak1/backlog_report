@@ -3,6 +3,7 @@ from datetime import date
 
 import pytest
 
+import backlog_weekly_report as bwr
 from backlog_weekly_report import _fmt_due, _issue_sort_key, get_week_range, safe_filename
 
 # 2026-03-05 は木曜日
@@ -79,3 +80,14 @@ def test_safe_filename_replaces_invalid_chars():
     assert safe_filename('A/B:C*D?E"F<G>H|I') == "A_B_C_D_E_F_G_H_I"
     assert safe_filename("全角　スペース") == "全角_スペース"
     assert safe_filename("バグ対応") == "バグ対応"
+
+
+def test_to_local_date_falls_back_to_strptime_for_other_shapes():
+    """
+    桁数が定型と違う日時も解釈すること。
+
+    速い経路は 20 文字ちょうどの `YYYY-MM-DDTHH:MM:SSZ` だけを見るため、
+    月日が 1 桁で返ってきた場合はここに落ちる。
+    """
+    assert bwr.to_local_date("2026-3-8T02:00:00Z") == "2026-03-08"
+    assert bwr.to_local_date("2026-3-8T15:30:00Z") == "2026-03-09"   # JST では翌日

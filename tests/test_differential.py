@@ -502,6 +502,23 @@ def test_falls_back_to_full_fetch_without_statuses():
     assert len(fetched) == len(client.get_issues(1, client.issued_queries[0]))
 
 
+def test_all_statuses_closed_skips_the_status_query():
+    """
+    全ステータスを完了系に登録した場合は、ステータス指定の問い合わせを省くこと。
+
+    「完了系でない課題」が存在しないため、1 本目のクエリは必ず空になる。
+    期間中に更新された課題を引く 2 本目だけで足りる。
+    """
+    client = RecordingClient([], {})
+    all_closed = [s["id"] for s in STATUSES]
+    bwr._fetch_target_issues(
+        client, 1, PERIOD_START, PERIOD_END, {}, STATUSES, all_closed,
+    )
+    assert len(client.issued_queries) == 1
+    assert "statusId" not in client.issued_queries[0]
+    assert client.issued_queries[0]["updatedSince"] == "2026-03-01"
+
+
 def test_filter_params_apply_to_both_queries():
     """フィルター条件は絞り込みの2つのクエリ両方に適用されること"""
     client = RecordingClient([], {})
