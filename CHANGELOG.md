@@ -9,6 +9,11 @@
 ## [Unreleased]
 
 ### Changed
+- `CLAUDE.md` に検査の節を置いた。`ws-conventions/bin` への言及が無く、手順の検査
+  （`check-commands.sh`）が照合する相手を見つけられずに「未対応」を返していた。
+  問題が無いのではなく、検査そのものが成立していない状態だった。使わない検査
+  （ADR 用の 2 本と `check-commands.sh` 自身）は、対象外である旨を書いてある。
+  `../proposals/check-commands-unestablished.md` の提案による
 - `.gitignore` に SSH の鍵の 5 行を足した（`id_rsa*` など）。共通規約 C の定型が
   広がったもので、`*.pem` / `*.key` は拡張子にしか当たらず、OpenSSH が既定で作る
   鍵（拡張子なし）を捕まえられないため。追跡中のファイルへの影響は無い

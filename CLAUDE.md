@@ -26,4 +26,15 @@ python -m mypy
 python -m tests.regen_golden
 ```
 
-Markdown を編集したときの検査は共通規約 D に従う。
+## 検査
+
+Markdown を編集したら、コミット前に次を実行する（[規約 D](../ws-conventions/README.md#d-編集後の検査)）。
+
+```bash
+../ws-conventions/bin/check-markdown.sh .
+../ws-conventions/bin/check-privacy.sh .
+```
+
+ADR は使っていない（`docs/adr/` も `docs/term-rules.md` も無い）ため、
+`check-terms.sh` と `gen-decision-index.py` は対象外。`bin/` にも `scripts/` にも
+検査スクリプトを置いていないため、`check-commands.sh` も対象外になる。
