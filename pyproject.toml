@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "backlog-weekly-report"
-version = "0.1.0"
+# CHANGELOG.md の最新の節に合わせる。
+version = "0.6.0"
 description = "Backlog の課題を期間集計して Markdown レポートを生成するスクリプト"
 requires-python = ">=3.10"
 dependencies = [

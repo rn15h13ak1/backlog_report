@@ -3,9 +3,14 @@
 [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) 形式に概ね準拠し、
 [セマンティックバージョニング](https://semver.org/lang/ja/) に従います。
 
-バージョンはコミット履歴からさかのぼって付けたもので、タグは打っていません。
+0.5.0 までのバージョンは、コミット履歴からさかのぼって付けたものです。
+タグは打っていません（この一覧の節がその役割を果たします）。
 
 ## [Unreleased]
+
+## [0.6.0] - 2026-09-21
+
+docmold で 3 列の HTML にできる出力を加え、単一モジュールを役割ごとに分けました。
 
 ### Added
 - docmold の `weekly3` に渡す Markdown を `weekly3_report.md` として出力する。

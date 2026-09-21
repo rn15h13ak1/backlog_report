@@ -474,8 +474,9 @@ python -m tests.regen_golden
 
 ## 変更履歴
 
-[CHANGELOG.md](CHANGELOG.md) を参照。バージョンはコミット履歴から
-さかのぼって付けたもので、タグは打っていません。
+[CHANGELOG.md](CHANGELOG.md) を参照。現在のバージョンは **0.6.0** です。
+[セマンティックバージョニング](https://semver.org/lang/ja/) に従い、タグは打たず
+CHANGELOG の節で示します（0.5.0 まではコミット履歴からさかのぼって付けたものです）。
 
 ---
 
