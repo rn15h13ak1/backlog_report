@@ -82,6 +82,7 @@ from backlog_report.snapshot import (  # noqa: F401
     write_snapshot,
 )
 from backlog_report.weekly3 import (  # noqa: F401
+    NOTICE_TITLE,
     ColumnEntry,
     PlanEntry,
     _snapshot_period_start,

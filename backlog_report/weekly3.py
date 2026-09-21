@@ -229,7 +229,12 @@ def generate_weekly3_report(
 
     notices = _weekly3_notices(all_filter_data, url_base)
     if notices:
-        lines += ["### 注意", ""] + notices + [""]
+        # docmold の callout_blockquote が枠付きのコールアウトにする。件数が実態と
+        # ずれうる事情なので、地の箇条書きのまま他の説明と同じ強さで並べない。
+        # 題の次の空の `>` は、箇条書きが題と 1 つの段落にまとまらないように要る。
+        lines += ["### 注意", "", f"> [!warning] {NOTICE_TITLE}", ">"]
+        lines += [f"> {line}" for line in notices]
+        lines.append("")
 
     lines += [f"## 前週（{span(prev_start, prev_end)}）", ""]
     lines += _weekly3_column(prev_entries, prev_note, url_base)
@@ -286,6 +291,10 @@ def _from_snapshot_entry(saved: dict) -> dict:
         "status": {"name": saved.get("status") or "-"},
         "dueDate": saved.get("dueDate"),
     }
+
+
+#: 注意書きのコールアウトの題。
+NOTICE_TITLE = "件数に影響する事情"
 
 
 def _weekly3_notices(all_filter_data: list, url_base: str = "") -> list:

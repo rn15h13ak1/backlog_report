@@ -189,6 +189,24 @@ def test_flows_are_noted_in_topics(key, expected):
     assert "PRJ-42" in topics
 
 
+def test_notices_are_wrapped_in_a_callout():
+    """
+    注意書きをコールアウトにすること。
+
+    件数が実態とずれうる事情なので、地の箇条書きのまま他の説明と同じ強さで
+    並べない。題の次の空の `>` は、箇条書きが題と 1 つの段落にまとまらない
+    ようにするために要る（無いと箇条書きにならない）。
+    """
+    data = basic_data()
+    data["inflow"] = [issue(42, "入ってきた課題", "未対応")]
+    notice = make(data=data).split("### 注意")[1].split("## 前週")[0]
+
+    assert notice.splitlines()[2] == f"> [!warning] {bwr.NOTICE_TITLE}"
+    assert notice.splitlines()[3] == ">"
+    assert "> - 全課題" not in notice
+    assert notice.splitlines()[4].startswith("> - バグ対応: 期間中に対象へ入った 1 件")
+
+
 def test_other_notices_are_listed():
     data = basic_data()
     data["comment_failures"] = {1, 2}
@@ -336,6 +354,7 @@ def test_outflow_issue_keeps_its_link():
     data = basic_data()
     data["completed"] = data["completed"] + [left]
     data["outflow"] = [left]
+    data["comment_failures"] = {9}        # 注意書き（コールアウト）も出す
 
     body = make(data=data, url_base=SPACE).split("## 今週")[1].split("\n## ")[0]
 
@@ -406,6 +425,10 @@ def test_docmold_converts_without_warnings(tmp_path):
         r'<span class="dm-entry__meta">対象外になった</span>',
         body,
     ), body
+    # 注意書きは枠付きのコールアウトになる（docmold 側で callout_blockquote が有効）
+    assert '<div class="dm-callout dm-callout--warn">' in body
+    assert f'<p class="dm-callout__title">{bwr.NOTICE_TITLE}</p>' in body
+    assert "<></>" not in body          # 空のタグが残らないこと
 
 
 # ==================================================================
