@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -1354,31 +1355,47 @@ def _weekly3_counts(counts: dict) -> str:
                       for key, label in zip(CATEGORY_KEYS, CATEGORY_LABELS, strict=True))
 
 
-def _weekly3_column(entries: list, note: str = "", url_base: str = "") -> list:
-    """
-    1 列ぶんの本文を組み立てる。
+class ColumnEntry(NamedTuple):
+    """weekly3 の 1 列に入る分類 1 つぶん。
 
-    entries: [(分類名, 件数の dict, カードにする課題のリスト, 分類ごとの注記)]
-    分類ごとの注記があるときは、件数と課題の代わりにその注記だけを出す。
+    note があるときは、件数と課題の代わりにその注記だけを出す
+    （絞り込み条件が前回と違う場合など）。
     """
+
+    name: str
+    counts: dict | None
+    issues: list
+    note: str = ""
+
+
+class PlanEntry(NamedTuple):
+    """「来週の予定」の列に入る分類 1 つぶん"""
+
+    name: str
+    issues: list
+
+
+def _weekly3_column(entries: list[ColumnEntry], note: str = "", url_base: str = "") -> list:
+    """1 列ぶんの本文を組み立てる。note があれば列ごとその注記だけを出す。"""
     if note:
         return [f"_（{note}）_", ""]
     if not entries:
         return ["_（対象なし）_", ""]
 
     lines: list = []
-    for name, counts, issues, entry_note in entries:
-        lines += [f"### {name}", ""]
-        if entry_note:
-            lines += [f"_（{entry_note}）_", ""]
+    for entry in entries:
+        lines += [f"### {entry.name}", ""]
+        if entry.note:
+            lines += [f"_（{entry.note}）_", ""]
             continue
-        lines += [_weekly3_counts(counts), ""]
-        lines += [_weekly3_entry(i, url_base) for i in issues] if issues else ["_（該当なし）_"]
+        lines += [_weekly3_counts(entry.counts), ""]
+        lines += ([_weekly3_entry(i, url_base) for i in entry.issues]
+                  if entry.issues else ["_（該当なし）_"])
         lines.append("")
     return lines
 
 
-def _weekly3_plan_column(entries: list, next_start: date, url_base: str = "") -> list:
+def _weekly3_plan_column(entries: list[PlanEntry], next_start: date, url_base: str = "") -> list:
     """
     「来週の予定」の列。⑤ をそのまま持ち越し、期限を過ぎているものを数える。
 
@@ -1387,10 +1404,11 @@ def _weekly3_plan_column(entries: list, next_start: date, url_base: str = "") ->
     """
     deadline = next_start.isoformat()
     lines: list = []
-    for name, issues in entries:
+    for entry in entries:
+        issues = entry.issues
         overdue = [i for i in issues if (i.get("dueDate") or "")[:10] < deadline
                    and i.get("dueDate")]
-        lines += [f"### {name}", "",
+        lines += [f"### {entry.name}", "",
                   f"予定:{len(issues)} / 期限切れ:{len(overdue)}", ""]
         if issues:
             overdue_ids = {i.get("id") for i in overdue}
@@ -1456,7 +1474,7 @@ def generate_weekly3_report(
             previous = entry.get("condition", "")
             current = conditions.get(name)
             if current is not None and previous != current:
-                prev_entries.append((
+                prev_entries.append(ColumnEntry(
                     _weekly3_name(name), None, [],
                     "絞り込み条件が今回と異なるため表示しません"
                     f"（前回: {previous or 'なし'}）",
@@ -1464,7 +1482,7 @@ def generate_weekly3_report(
                 continue
 
             issues = (entry.get("completed") or []) + (entry.get("incomplete") or [])
-            prev_entries.append((
+            prev_entries.append(ColumnEntry(
                 _weekly3_name(name), counts,
                 _mark_outflow(
                     sorted((_from_snapshot_entry(i) for i in issues), key=_issue_sort_key),
@@ -1505,15 +1523,16 @@ def generate_weekly3_report(
 
     lines += [f"## 今週（{span(period_start, period_end)}）", ""]
     lines += _weekly3_column([
-        (_weekly3_name(name), {key: len(data[key]) for key in CATEGORY_KEYS},
-         _mark_outflow(sorted(data["completed"] + data["incomplete"], key=_issue_sort_key),
-                       {i.get("id") for i in (data.get("outflow") or [])}), "")
+        ColumnEntry(_weekly3_name(name), {key: len(data[key]) for key in CATEGORY_KEYS},
+                    _mark_outflow(sorted(data["completed"] + data["incomplete"],
+                                         key=_issue_sort_key),
+                                  {i.get("id") for i in (data.get("outflow") or [])}))
         for name, data in all_filter_data
     ], "", url_base)
 
     lines += [f"## 来週の予定（{span(next_start, next_end)}）", ""]
     lines += _weekly3_plan_column(
-        [(_weekly3_name(name), sorted(data["incomplete"], key=_issue_sort_key))
+        [PlanEntry(_weekly3_name(name), sorted(data["incomplete"], key=_issue_sort_key))
          for name, data in all_filter_data],
         next_start,
         url_base,
