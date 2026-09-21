@@ -133,10 +133,10 @@ pip install -e ".[dev]"
 
 ### 3. `config.yaml` の作成
 
-`config.sample.yaml` をコピーして `config.yaml` を作成し、自分の環境に合わせて編集してください。
+`config.example.yaml` をコピーして `config.yaml` を作成し、自分の環境に合わせて編集してください。
 
 ```bash
-cp config.sample.yaml config.yaml
+cp config.example.yaml config.yaml
 ```
 
 最低限以下の 3 箇所を設定してください。
@@ -373,7 +373,7 @@ python ../docmold/docmold.py reports/20260316_20260322/weekly3_report.md
 
 ## 注意事項
 
-- **API キーの管理**: `config.yaml` は `.gitignore` で管理対象外になっています。`config.sample.yaml` をコピーして使用してください。
+- **API キーの管理**: `config.yaml` は `.gitignore` で管理対象外になっています。`config.example.yaml` をコピーして使用してください。
 - **処理時間**: 各課題のコメント履歴を取得してステータス変化を判定しますが、
   次の3段階で API の呼び出し回数を抑えています。
     1. **課題の取得を絞る** — 「現在のステータスが完了系」かつ「期間開始以降に更新なし」の
@@ -453,7 +453,7 @@ python -m tests.regen_golden
 backlog_report/
   ├── backlog_weekly_report.py   # メインスクリプト
   ├── check_api.py               # API 接続診断スクリプト
-  ├── config.sample.yaml         # 設定ファイルのテンプレート（これをコピーして config.yaml を作成）
+  ├── config.example.yaml        # 設定ファイルのテンプレート（これをコピーして config.yaml を作成）
   ├── config.yaml                # 実際の設定ファイル（.gitignore で管理対象外）
   ├── pyproject.toml             # 依存関係・pytest / ruff / カバレッジの設定
   ├── CHANGELOG.md               # 変更履歴

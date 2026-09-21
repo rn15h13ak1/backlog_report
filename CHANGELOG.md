@@ -36,6 +36,9 @@
     `summary_report.md` は課題番号のまま
 
 ### Changed
+- 設定のテンプレートを `config.example.yaml` に改名した。共通規約が設定の
+  テンプレートを `*.example.*` と定めているため。過去のバージョンに残る
+  `config.sample.yaml` は、その時点の事実なのでそのままにする
 - `snapshot.json` に、抽出対象から外れて ④ に入れた課題の ID を追加した。次回の
   weekly3 レポートの「前週」の列でも、完了させた課題と区別して印を付けるために使う
 - `snapshot.json` に、フィルターごとの件数と ④ 完了の課題を追加した。次回の
