@@ -2064,11 +2064,12 @@ def run(argv: list | None = None) -> None:
     weekly3_path.write_text(weekly3_md, encoding="utf-8")
     print(f"  ✅ weekly3 用に保存: {weekly3_path}")
 
+    # 記録はフィルターの有無にかかわらず書き出す。次回の出入りの判定と
+    # weekly3 の「前週」の列に使うため。
     snapshot_path = write_snapshot(output_dir, build_snapshot(
         period_start, period_end, snapshot_entries
     ))
-    if filters_cfg:
-        print(f"  ✅ 次回照合用の記録: {snapshot_path}")
+    print(f"  ✅ 次回照合用の記録: {snapshot_path}")
 
 
 def main():
