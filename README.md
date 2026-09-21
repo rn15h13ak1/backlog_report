@@ -498,6 +498,7 @@ backlog_report/
   ├── pyproject.toml             # 依存関係・pytest / ruff / mypy / カバレッジの設定
   ├── CHANGELOG.md               # 変更履歴
   ├── CLAUDE.md                  # 共通規約への参照
+  ├── LICENSE                    # MIT ライセンス
   ├── tests/                     # 単体テスト
   │     ├── golden/              # レポート出力の比較用ファイル
   │     └── _legacy.py           # 差分テスト用に凍結した旧実装
@@ -510,3 +511,9 @@ backlog_report/
               ├── weekly3_report.md   # docmold の weekly3 に渡す Markdown
               └── snapshot.json       # 次回照合用の記録
 ```
+
+---
+
+## ライセンス
+
+MIT License。全文は [LICENSE](LICENSE) にあります。
