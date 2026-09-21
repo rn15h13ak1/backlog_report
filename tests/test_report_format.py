@@ -11,6 +11,7 @@
 ゴールデンファイルを意図的に更新するとき:
     python -m tests.regen_golden
 """
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -136,6 +137,23 @@ def test_unknown_status_shows_warning_with_names():
     assert "レビュー中、保留" in text
 
 
+def test_unknown_status_is_listed_inside_the_equation_warning():
+    """
+    等式が崩れているときは、設定外ステータスの名前を警告の中にまとめること。
+
+    件数が合わない原因がステータス名の食い違いであることが多く、別々に出すと
+    結び付けて読めない。
+    """
+    data = basic_data()
+    data["completed"] = []                          # 等式を崩す
+    data["unknown_statuses"] = {"レビュー中"}
+    text = make_report(data)
+
+    warning = text.split("一致しません")[1].split("---")[0]
+    assert "レビュー中" in warning
+    assert text.count("レビュー中") == 1            # 二重に出さない
+
+
 def test_comment_failure_shows_warning_with_count():
     data = basic_data()
     data["comment_failures"] = {101, 102, 103}
@@ -202,3 +220,34 @@ def test_period_is_shown_in_header():
     text = make_report(basic_data())
     assert f"# レポート — {PERIOD_START:%Y/%m/%d} 〜 {PERIOD_END:%Y/%m/%d}" in text
     assert "> 生成日時: 2026-03-09 10:30" in text
+
+
+def test_sections_are_sorted_by_issue_key():
+    """
+    各セクションを課題番号順に並べること。
+
+    ⑤ は集合から組み立てるため並びが定まらず、課題が 1 件増えるだけで順序が
+    入れ替わって、前の期間のレポートと見比べにくくなっていた。
+    """
+    data = basic_data()
+    unsorted = [issue(10, "十番", "処理中"), issue(2, "二番", "処理中"),
+                issue(101, "百一番", "未対応")]
+    data["carry_over"] = unsorted
+    data["incomplete"] = list(reversed(unsorted))
+    data["new_issues"] = []
+    data["completed"] = []
+
+    text = make_report(data)
+    for heading in ("## ① 前週残件", "## ⑤ 当週未完了"):
+        block = text.split(heading)[1].split("</details>")[0]
+        assert re.findall(r"PRJ-\d+", block)[:3] == ["PRJ-2", "PRJ-10", "PRJ-101"], heading
+
+
+def test_flow_notes_are_sorted_by_issue_key():
+    data = basic_data()
+    data["inflow"] = [issue(10, "十番", "未対応"), issue(2, "二番", "未対応")]
+    data["outflow"] = [issue(30, "三十番", "処理中"), issue(4, "四番", "処理中")]
+
+    text = make_report(data)
+    assert "② 新規発生に含めています: PRJ-2、PRJ-10" in text
+    assert "④ 当週完了に含めています: PRJ-4、PRJ-30" in text

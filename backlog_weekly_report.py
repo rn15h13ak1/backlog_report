@@ -1177,10 +1177,10 @@ def _build_notice_lines(data: dict) -> list:
         lines.append("> 抽出対象への出入りを前回の集計と突き合わせて反映しています。")
         if inflow:
             lines.append(f"> 期間中に対象へ入った **{len(inflow)}** 件は ② 新規発生に含めています: "
-                         f"{keys_str(inflow)}")
+                         f"{keys_str(sorted(inflow, key=_issue_sort_key))}")
         if outflow:
             lines.append(f"> 期間中に対象から外れた **{len(outflow)}** 件は ④ 当週完了に含めています: "
-                         f"{keys_str(outflow)}")
+                         f"{keys_str(sorted(outflow, key=_issue_sort_key))}")
         lines.append("")
 
     if flow_unavailable:
@@ -1256,6 +1256,10 @@ def generate_markdown_report(
          f"{we_str} 時点で完了系でない（オープンな）課題", TABLE_MAX_DISPLAY_INCOMPLETE),
     ]
     for title, issues, description, max_display in sections:
+        # 課題番号順に並べる。⑤ は集合から組み立てるため並びが定まらず、課題が
+        # 1 件増えるだけで順序が入れ替わって、前の期間のレポートと見比べにくい。
+        # 横断サマリーと weekly3 も課題番号順なので、資料ごとの並びを揃える。
+        issues = sorted(issues, key=_issue_sort_key)
         lines += [
             "---",
             "",
@@ -1559,10 +1563,12 @@ def _weekly3_notices(all_filter_data: list, url_base: str = "") -> list:
         label = _weekly3_name(name)
         if data.get("inflow"):
             lines.append(f"- {label}: 期間中に対象へ入った {len(data['inflow'])} 件を "
-                         f"② 新規発生に含めた（{keys_str(data['inflow'], url_base)}）")
+                         "② 新規発生に含めた（"
+                         f"{keys_str(sorted(data['inflow'], key=_issue_sort_key), url_base)}）")
         if data.get("outflow"):
             lines.append(f"- {label}: 期間中に対象から外れた {len(data['outflow'])} 件を "
-                         f"④ 当週完了に含めた（{keys_str(data['outflow'], url_base)}）")
+                         "④ 当週完了に含めた（"
+                         f"{keys_str(sorted(data['outflow'], key=_issue_sort_key), url_base)}）")
         if data.get("comment_failures"):
             lines.append(f"- {label}: {len(data['comment_failures'])} 件の課題で"
                          "コメント履歴を取得できなかった")
