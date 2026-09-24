@@ -1,9 +1,15 @@
 """定数・型・共通の小物。ほかのモジュールはここだけに依存する。"""
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import TypedDict
 
 # Backlog API は UTC で日時を返すため、日付判定は JST に変換して行う
+#: リポジトリの根。`config.yaml` と出力先を、実行位置ではなくここを基準に解決する
+#: （フルパスで起動しても同じ場所を見るため）。このファイルはパッケージの中に
+#: あるので、1 つ上の階層が根になる。
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 JST = timezone(timedelta(hours=9))
 
 

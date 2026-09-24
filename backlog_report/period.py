@@ -6,7 +6,7 @@ from pathlib import Path
 
 import yaml
 
-from backlog_report.core import DEFAULT_MAX_WORKERS, JST, MAX_WORKERS_LIMIT
+from backlog_report.core import DEFAULT_MAX_WORKERS, JST, MAX_WORKERS_LIMIT, REPO_ROOT
 
 WEEK_START_MAP = {
     "monday":    0,
@@ -89,7 +89,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
   python backlog_weekly_report.py
 """,
     )
-    default_config = str(Path(__file__).parent / "config.yaml")
+    default_config = str(REPO_ROOT / "config.yaml")
     parser.add_argument("--config", default=default_config,
                         help="設定ファイルのパス（デフォルト: スクリプトと同じディレクトリの config.yaml）")
     parser.add_argument("--week", choices=["previous", "current"],

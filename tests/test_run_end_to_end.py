@@ -8,6 +8,8 @@ run() を通しで動かすテスト。
 出力先は一時ディレクトリに向けるため、リポジトリ配下には何も生成しない。
 """
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -483,6 +485,32 @@ def test_run_continues_when_custom_field_master_fails(tmp_path, monkeypatch, cap
     assert "カスタム属性マスターの取得に失敗" in err
     assert "カスタム属性「対応チーム」が見つかりません" in err
     assert (out / PERIOD_DIR / "weekly_report_属性なし.md").exists()
+
+
+def test_default_config_path_is_the_repository_root():
+    """
+    `--config` を省いたときに読む設定ファイルは、リポジトリ直下の config.yaml。
+
+    実装をパッケージへ移したとき、`Path(__file__).parent` がパッケージの中を
+    指すようになり、`backlog_report/backlog_report/config.yaml` を探していた。
+    引数を渡さずに起動する呼び出し（tool_launcher など）が動かなくなる。
+    """
+    args = bwr.build_arg_parser().parse_args([])
+    assert Path(args.config) == Path(bwr.__file__).resolve().parent / "config.yaml"
+
+
+def test_default_config_path_does_not_depend_on_the_working_directory(tmp_path):
+    """別のディレクトリから起動しても、同じ設定ファイルを指すこと"""
+    result = subprocess.run(
+        [sys.executable, str(Path(bwr.__file__).resolve())],
+        capture_output=True, text=True, cwd=str(tmp_path),
+    )
+    expected = Path(bwr.__file__).resolve().parent / "config.yaml"
+    if expected.exists():
+        # 実環境に設定があるときは、読めていること（見つからない旨が出ないこと）
+        assert "設定ファイルが見つかりません" not in result.stderr
+    else:
+        assert str(expected) in result.stderr
 
 
 def test_run_resolves_relative_output_dir_against_script(tmp_path, stub, monkeypatch):
