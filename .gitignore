@@ -42,6 +42,7 @@ __pycache__/
 venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 
 # カバレッジ計測の出力
 .coverage
